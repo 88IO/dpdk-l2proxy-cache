@@ -16,6 +16,8 @@
 #include <rte_hash.h>
 #include <rte_jhash.h>
 
+#include <unistd.h>
+
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
@@ -26,12 +28,13 @@
 #define PORT0 0
 #define PORT1 1
 
-#define CACHE_ENTRY_SIZE 1024
+#define CACHE_ENTRY_SIZE 8096
 #define RESP_MAX_KEY_LENGTH 256
 #define MAX_CACHE_DATA_LENGTH 1024
 
 #define KEY_ENTRY_SIZE 512
 #define ARP_ENTRY_SIZE 64
+#define CONN_ENTRY_SIZE 512
 
 #define FNV_OFFSET_BASIS_32 2166136261
 #define FNV_PRIME_32 16777619
@@ -49,11 +52,18 @@
 
 static volatile bool force_quit;
 
+struct tcp_key {
+	rte_be32_t client_addr;
+	rte_be32_t server_addr;
+	rte_be16_t client_port;
+};
+
 struct sequence_unique {
 	rte_be32_t client_addr;
 	rte_be32_t server_addr;
-	rte_be32_t seq;
 	rte_be16_t client_port;
+	rte_be16_t server_port;
+	rte_be32_t seq;
 };
 
 struct tcp_timestamp {
@@ -79,6 +89,13 @@ struct cache_key {
 	char key[RESP_MAX_KEY_LENGTH];
 };
 
+struct tcp_info {
+	uint32_t recv_bytes;
+	uint32_t send_bytes;
+	rte_be32_t seq;
+	uint32_t prev_cache_index;
+};
+
 struct _stats {
 	uint32_t get_hit;
 	uint32_t get_miss;
@@ -90,12 +107,12 @@ struct _stats {
 };
 struct _stats stats0, stats1;
 
-static struct cache_entry resp_cache[CACHE_ENTRY_SIZE];
+static struct cache_entry *resp_cache;
 
 static inline uint32_t
 fnv_hash(const char *key, uint32_t length, uint32_t initval) 
 {
-	uint32_t off;
+    uint32_t off;
     uint32_t hash = initval;
 
     for (off = 0; off < length; off++) {
@@ -147,6 +164,17 @@ static struct rte_hash_parameters arp_param = {
 
 static struct rte_ether_addr arp_table[ARP_ENTRY_SIZE];
 
+static struct rte_hash_parameters tcp_param = {
+	.name = "tcp_info",
+	.entries = CONN_ENTRY_SIZE,
+	.key_len = sizeof(struct tcp_key),
+	.hash_func = rte_jhash,
+	.hash_func_init_val = 0,
+	.socket_id = 0,
+};
+
+static struct tcp_info tcp_table[CONN_ENTRY_SIZE];
+
 enum resp_method {
     GET,
     SET,
@@ -163,7 +191,7 @@ static inline int
 port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 {
 	struct rte_eth_conf port_conf;
-	const uint16_t rx_rings = 1, tx_rings = 1 + (port == 0);
+	const uint16_t rx_rings = 1, tx_rings = 2;
 	uint16_t nb_rxd = RX_RING_SIZE;
 	uint16_t nb_txd = TX_RING_SIZE;
 	int retval;
@@ -283,9 +311,9 @@ arp_process(struct rte_ether_hdr *eth, struct rte_hash *arp_handle, struct rte_e
 static int
 client2server(__rte_unused void *arg)
 {
-	int ret;
-	unsigned lcore_id, nb_hit, nb_miss;
-	struct rte_mbuf *bufs[BURST_SIZE], *bufs_hit[BURST_SIZE];
+	int ret, ret_hit, payload_len_diff;
+	uint32_t lcore_id, nb_reply, nb_pass, sig, key_len, key_hash, cache_index, payload_len;
+	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
 	struct rte_mbuf *m;
 	struct rte_ether_hdr *eth;
 	// struct rte_ether_addr eth_tx_port_addr, eth_server_addr;
@@ -293,12 +321,13 @@ client2server(__rte_unused void *arg)
 	struct rte_tcp_hdr *tcph;
 	struct tcp_timestamp *ts;
 	char *pos, *payload;
-	struct rte_hash *arp_handle, *key_handle;
+	struct rte_hash *arp_handle, *key_handle, *tcp_handle;
 	enum resp_method resp_m;
-	uint32_t key_len, key_hash, cache_index, payload_len;
-	int payload_len_diff;
 	struct cache_entry *entry;
-	struct sequence_unique seq_uniq;
+	struct sequence_unique seq_uniq = {
+		.server_port = 6379
+	};
+	struct tcp_info *hit_info;
 
 	// ret = rte_ether_unformat_addr("a0:36:9f:3f:20:24", &eth_server_addr);
 	// if (ret != 0)
@@ -316,6 +345,10 @@ client2server(__rte_unused void *arg)
 	if (!key_handle)
 		return -ENOENT;
 
+	tcp_handle = rte_hash_find_existing(tcp_param.name);
+	if (!tcp_handle)
+		return -ENOENT;
+
 	lcore_id = rte_lcore_id();
 	printf("lcore %u: client --> server\n", lcore_id);
 
@@ -326,7 +359,7 @@ client2server(__rte_unused void *arg)
 		if (unlikely(nb_rx == 0))
 			continue;
 
-		nb_hit = nb_miss = 0;
+		nb_reply = nb_pass = 0;
 		//printf("lcore %u: rx (%u pkts) from queue %u\n", lcore_id, nb_rx, queue_id);
 
 		for (uint16_t j = 0; j < nb_rx; j++) {
@@ -351,11 +384,32 @@ client2server(__rte_unused void *arg)
 
 				payload_len = rte_pktmbuf_data_len(m) + (void*)eth - (void*)payload;
 
-				if (payload_len == 0)
-					goto pass;
+				seq_uniq.client_addr = ipv4h->src_addr;
+				seq_uniq.server_addr = ipv4h->dst_addr;
+				seq_uniq.client_port = tcph->src_port;
+
+				sig = rte_hash_hash(tcp_handle, &seq_uniq);
+				if (tcph->tcp_flags & RTE_TCP_FIN_FLAG) {
+					ret = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
+				}
+				if ((ret_hit = rte_hash_lookup_with_hash(tcp_handle, &seq_uniq, sig)) >= 0) {
+					hit_info = &tcp_table[ret_hit];
+				};
+
+				// if (ret_hit >= 0 && payload_len == 0 && !(tcph->tcp_flags & (RTE_TCP_SYN_FLAG | RTE_TCP_FIN_FLAG))) {
+				// 	RTE_SWAP(eth->src_addr, eth->dst_addr);
+				// 	RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
+				// 	RTE_SWAP(tcph->src_port, tcph->dst_port);
+				// 	RTE_SWAP(tcph->sent_seq, tcph->recv_ack);
+				// 	bufs_reply[nb_reply++] = m;
+				// 	continue;
+				// }
+
+				if (payload_len == 0) 
+					goto resp;
 
 				if ((resp_m = determine_method(pos)) == NONE)
-					goto pass;
+					goto resp;
 
 				pos += 13;
 
@@ -377,9 +431,9 @@ client2server(__rte_unused void *arg)
 				
 				switch (resp_m) {
 				case GET:
-					DEBUG_PRINTF("entry->valid = %d, entry->hash = %u, entry->key = %.*s\n",
+					DEBUG_PRINTF("      entry->valid = %d, entry->hash = %u, entry->key = %.*s\n",
 						entry->valid, entry->hash, entry->key_len, entry->key);
-					DEBUG_PRINTF("                   hash = %u,        key = %.*s\n",
+					DEBUG_PRINTF("      hash = %u,        key = %.*s\n",
 						key_hash, key_len, pos);
 					if (entry->valid && key_hash == entry->hash
 							&& !strncmp(pos, entry->key, key_len)) {
@@ -396,7 +450,13 @@ client2server(__rte_unused void *arg)
 						}
 
 						DEBUG_PRINTF("reply\n");
-					
+
+						if (ret_hit < 0 && (ret_hit = rte_hash_add_key(tcp_handle, &seq_uniq)) >= 0) {
+							hit_info = &tcp_table[ret_hit];
+						}
+						hit_info->recv_bytes += payload_len;
+						hit_info->send_bytes += entry->data_len;
+
 						rte_memcpy(payload, entry->data, entry->data_len);
 
 						RTE_SWAP(eth->src_addr, eth->dst_addr);
@@ -419,16 +479,16 @@ client2server(__rte_unused void *arg)
 
 						tcph->cksum = 0;
 						tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
-
-						bufs_hit[nb_hit++] = m;
+				
+						bufs_reply[nb_reply++] = m;
 						continue;
 
 					} else {
 						DEBUG_PRINTF("%d: GET MISS hook.\n", lcore_id);
-						seq_uniq.client_addr = ipv4h->src_addr;
-						seq_uniq.server_addr = ipv4h->dst_addr;
+						// seq_uniq.client_addr = ipv4h->src_addr;
+						// seq_uniq.server_addr = ipv4h->dst_addr;
+						// seq_uniq.client_port = tcph->src_port;
 						seq_uniq.seq = tcph->recv_ack;
-						seq_uniq.client_port = tcph->src_port;
 
 						if ((ret = rte_hash_add_key(key_handle, &seq_uniq)) >= 0) {
 							struct cache_key *ck = &key_table[ret];
@@ -442,6 +502,10 @@ client2server(__rte_unused void *arg)
 							DEBUG_PRINTF("      seq = %u\n", seq_uniq.seq);
 							DEBUG_PRINTF("      client_port = %u\n", seq_uniq.client_port);
 						}
+						uint32_t sig = rte_hash_hash(key_handle, &seq_uniq);
+						DEBUG_PRINTF("%d: %u\n", lcore_id, sig);
+						stats0.get_miss++;
+						//printf("%.*s = %u (%u)\n", key_len, pos, key_hash, cache_index); 
 					}	
 					break;
 				case SET:
@@ -455,6 +519,13 @@ client2server(__rte_unused void *arg)
 					break;
 				} 
 
+resp:
+				if (ret_hit >= 0) {
+					tcph->sent_seq = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) - hit_info->recv_bytes);
+					tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->recv_ack) - hit_info->send_bytes);
+					tcph->cksum = 0;
+					tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
+				}
 				// if (!rte_is_broadcast_ether_addr(&eth->dst_addr)
 				// 	) {
 				// 	rte_ether_addr_copy(&eth_server_addr, &eth->dst_addr);
@@ -468,24 +539,25 @@ client2server(__rte_unused void *arg)
 
 			/* replace ethernet source address (client -> port1) */
 			// rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
+			
 pass:
-			bufs[nb_miss++] = m;
+			bufs[nb_pass++] = m;
 		}
 
 		/* Send burst of TX packets, to second port of pair. */
-		const uint16_t nb_tx1 = rte_eth_tx_burst(PORT0, 1, bufs_hit, nb_hit);
+		const uint16_t nb_tx1 = rte_eth_tx_burst(PORT0, 1, bufs_reply, nb_reply);
 		stats0.reply += nb_tx1;
 		/* Free any unsent packets. */
-		if (unlikely(nb_tx1 < nb_hit)) {
-			rte_pktmbuf_free_bulk(&bufs_hit[nb_tx1], nb_hit - nb_tx1);
+		if (unlikely(nb_tx1 < nb_reply)) {
+			rte_pktmbuf_free_bulk(&bufs_reply[nb_tx1], nb_reply - nb_tx1);
 		}
 
 		/* Send burst of TX packets, to first port of pair. */
-		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT1, 0, bufs, nb_miss);
+		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT1, 0, bufs, nb_pass);
 		stats0.pass += nb_tx0;
 		/* Free any unsent packets. */
-		if (unlikely(nb_tx0 < nb_miss)) {
-			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_miss - nb_tx0);
+		if (unlikely(nb_tx0 < nb_pass)) {
+			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_pass - nb_tx0);
 		}
 
 		stats0.error += nb_rx - nb_tx0 - nb_tx1;
@@ -497,19 +569,21 @@ pass:
 static int
 server2client(__rte_unused void *arg)
 {
-	int ret;
-	unsigned lcore_id;
-	struct rte_mbuf *bufs[BURST_SIZE];
+	int ret, ret_hit;
+	uint32_t lcore_id, nb_reply, nb_pass, sig, cache_index, payload_len;
+	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
 	struct rte_mbuf *m;
 	struct rte_ether_hdr *eth;
 	// struct rte_ether_addr eth_tx_port_addr, eth_client_addr;
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
-	struct rte_hash *arp_handle, *key_handle;
+	struct rte_hash *arp_handle, *key_handle, *tcp_handle;
 	char *payload;
-	struct sequence_unique seq_uniq;
+	struct sequence_unique seq_uniq = {
+		.server_port = 6379
+	};
 	struct cache_entry *entry;
-	uint32_t cache_index, payload_len, sig;
+	struct tcp_info *hit_info;
 
 	// ret = rte_ether_unformat_addr("a0:36:9f:53:ae:c8", &eth_client_addr);
 	// if (ret != 0)
@@ -527,6 +601,10 @@ server2client(__rte_unused void *arg)
 	if (!key_handle)
 		return -ENOENT;
 
+	tcp_handle = rte_hash_find_existing(tcp_param.name);
+	if (!tcp_handle)
+		return -ENOENT;
+
 	lcore_id = rte_lcore_id();
 	printf("lcore %u: server --> client\n", lcore_id);
 
@@ -536,6 +614,8 @@ server2client(__rte_unused void *arg)
 
 		if (unlikely(nb_rx == 0))
 			continue;
+
+		nb_reply = nb_pass = 0;
 
 		//printf("lcore %u: rx (%u pkts) from queue %u\n", lcore_id, nb_rx, queue_id);
 
@@ -549,24 +629,41 @@ server2client(__rte_unused void *arg)
 				ipv4h = (struct rte_ipv4_hdr *)(eth + 1);
 	
 				if (ipv4h->next_proto_id != IPPROTO_TCP) 
-					continue;
+					goto pass;
 				
 				tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
 
 				if (tcph->src_port != rte_cpu_to_be_16(6379))
-					continue;				
+					goto pass;				
 
 				payload = (char *)((void *)tcph + (tcph->data_off >> 2));
 
 				payload_len = rte_pktmbuf_data_len(m) + (void*)eth - (void*)payload;
 
-				if (payload_len == 0 || payload[0] != '$')
-					continue;
-
 				seq_uniq.client_addr = ipv4h->dst_addr;
 				seq_uniq.server_addr = ipv4h->src_addr;
-				seq_uniq.seq = tcph->sent_seq;
 				seq_uniq.client_port = tcph->dst_port;
+				
+				if ((ret_hit = rte_hash_lookup(tcp_handle, &seq_uniq)) >= 0) {
+					// if (payload_len == 0 && !(tcph->tcp_flags & (RTE_TCP_SYN_FLAG | RTE_TCP_FIN_FLAG))) {
+					// 	RTE_SWAP(eth->src_addr, eth->dst_addr);
+					// 	RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
+					// 	RTE_SWAP(tcph->src_port, tcph->dst_port);
+					// 	RTE_SWAP(tcph->sent_seq, tcph->recv_ack);
+					// 	bufs_reply[nb_reply++] = m;
+					// 	continue;
+					// }
+					hit_info = &tcp_table[ret_hit];
+					tcph->sent_seq = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) + hit_info->send_bytes);
+					tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->recv_ack) + hit_info->recv_bytes);
+					tcph->cksum = 0;
+					tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
+				};
+
+				if (payload_len == 0 || payload[0] != '$')
+					goto pass;
+
+				seq_uniq.seq = tcph->sent_seq;
 
 				DEBUG_PRINTF("%d: lookup key_info:\n", lcore_id);
 				DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.client_addr);
@@ -575,8 +672,10 @@ server2client(__rte_unused void *arg)
 				DEBUG_PRINTF("      client_port = %u\n", seq_uniq.client_port);
 
 				sig = rte_hash_hash(key_handle, &seq_uniq);
-				if ((ret = rte_hash_lookup_with_hash(key_handle, &seq_uniq, sig)) < 0) 
-					continue;
+				DEBUG_PRINTF("%d: %u\n", lcore_id, sig);
+				if ((ret = rte_hash_lookup_with_hash(key_handle, &seq_uniq, sig)) < 0) {
+					goto pass;
+				}
 				
 				struct cache_key *ck = &key_table[ret];
 				cache_index = ck->hash % CACHE_ENTRY_SIZE;
@@ -610,16 +709,27 @@ server2client(__rte_unused void *arg)
 
 			/* replace ethernet source address (client -> port1) */
 			// rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
+pass:
+			bufs[nb_pass++] = m;
 		}
 
 		/* Send burst of TX packets, to second port of pair. */
-		const uint16_t nb_tx = rte_eth_tx_burst(PORT0, 0, bufs, nb_rx);
-		stats1.pass += nb_tx;
+		const uint16_t nb_tx1 = rte_eth_tx_burst(PORT1, 1, bufs_reply, nb_reply);
+		stats1.reply += nb_tx1;
 		/* Free any unsent packets. */
-		if (unlikely(nb_tx < nb_rx)) {	
-			rte_pktmbuf_free_bulk(&bufs[nb_tx], nb_rx - nb_tx);
+		if (unlikely(nb_tx1 < nb_reply)) {
+			rte_pktmbuf_free_bulk(&bufs_reply[nb_tx1], nb_reply - nb_tx1);
 		}
-		stats1.error += nb_rx - nb_tx;
+
+		/* Send burst of TX packets, to first port of pair. */
+		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT0, 0, bufs, nb_pass);
+		stats1.pass += nb_tx0;
+		/* Free any unsent packets. */
+		if (unlikely(nb_tx0 < nb_pass)) {
+			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_pass - nb_tx0);
+		}
+
+		stats1.error += nb_rx - nb_tx0 - nb_tx1;
 	}
 
 	return 0;
@@ -631,8 +741,8 @@ signal_handler(int signum)
 	if (signum == SIGINT || signum == SIGTERM) {
 		printf("\n\nSignal %d received, preparing to exit...\n",
 				signum);
-		printf("stats: client --> server\n  pass = %u, reply = %u, error = %u\n",
-				stats0.pass, stats0.reply, stats0.error);
+		printf("stats: client --> server\n  pass = %u (get_miss = %u), reply = %u, error = %u\n",
+				stats0.pass, stats0.get_miss, stats0.reply, stats0.error);
 		printf("stats: client <-- server\n  pass = %u, reply = %u, error = %u\n",
 				stats1.pass, stats1.reply, stats1.error);
 		force_quit = true;
@@ -717,7 +827,13 @@ main(int argc, char *argv[])
 	handle = rte_hash_create(&key_param);
 	if (!handle)
 		rte_exit(EXIT_FAILURE, "Cannot init key table.\n");
+
+	handle = rte_hash_create(&tcp_param);
+	if (!handle)
+		rte_exit(EXIT_FAILURE, "Cannot init conn table.\n");
 	
+	resp_cache = calloc(CACHE_ENTRY_SIZE, sizeof(struct cache_entry));
+
 	// worker lcore
 	// RTE_LCORE_FOREACH_WORKER(lcoreid) {
 	// 	if (lcoreid % 2 == 0) {
