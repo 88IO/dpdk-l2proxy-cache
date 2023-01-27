@@ -16,8 +16,6 @@
 #include <rte_hash.h>
 #include <rte_jhash.h>
 
-#include <unistd.h>
-
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
@@ -92,8 +90,7 @@ struct cache_key {
 struct tcp_info {
 	uint32_t recv_bytes;
 	uint32_t send_bytes;
-	rte_be32_t seq;
-	uint32_t prev_cache_index;
+	rte_be32_t client_seq;
 };
 
 struct _stats {
@@ -262,10 +259,10 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 			port, RTE_ETHER_ADDR_BYTES(&addr));
 
 	/* Enable RX in promiscuous mode for the Ethernet device. */
-	retval = rte_eth_promiscuous_enable(port);
+	// retval = rte_eth_promiscuous_enable(port);
 	/* End of setting RX port in promiscuous mode. */
-	if (retval != 0)
-		return retval;
+	// if (retval != 0)
+	// 	return retval;
 
 	return 0;
 }
@@ -316,7 +313,7 @@ client2server(__rte_unused void *arg)
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
 	struct rte_mbuf *m;
 	struct rte_ether_hdr *eth;
-	// struct rte_ether_addr eth_tx_port_addr, eth_server_addr;
+	struct rte_ether_addr eth_tx_port_addr; //, eth_server_addr;
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
 	struct tcp_timestamp *ts;
@@ -333,9 +330,9 @@ client2server(__rte_unused void *arg)
 	// if (ret != 0)
 	// 	return ret;
 	
-	// ret = rte_eth_macaddr_get(1, &eth_tx_port_addr);
-	// if (ret != 0)
-	// 	return ret;
+	ret = rte_eth_macaddr_get(1, &eth_tx_port_addr);
+	if (ret != 0)
+		return ret;
 	
 	arp_handle = rte_hash_find_existing(arp_param.name);
 	if (!arp_handle)
@@ -465,7 +462,7 @@ client2server(__rte_unused void *arg)
 						if (likely(ts->kind == 8)) {
 							rte_be32_t tmp_val = ts->ecr;
 							ts->ecr = ts->val;
-							ts->val = rte_cpu_to_be_32(rte_be_to_cpu_32(tmp_val) + 100);
+							ts->val = rte_cpu_to_be_32(rte_be_to_cpu_32(tmp_val) + 1);
 						}
 						ipv4h->total_length = rte_cpu_to_be_16(
 							rte_be_to_cpu_16(ipv4h->total_length) + payload_len_diff);
@@ -526,21 +523,22 @@ resp:
 					tcph->cksum = 0;
 					tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
 				}
-				// if (!rte_is_broadcast_ether_addr(&eth->dst_addr)
-				// 	) {
-				// 	rte_ether_addr_copy(&eth_server_addr, &eth->dst_addr);
-				// 	//  && (ret = rte_hash_lookup(arp_handle, &ipv4h->dst_addr)) >= 0) {
-				// 	// rte_ether_addr_copy(&arp_table[ret], &eth->dst_addr);
-				// }
+			
+pass:			
+				if (!rte_is_broadcast_ether_addr(&eth->dst_addr)
+					// ) {
+					// rte_ether_addr_copy(&eth_server_addr, &eth->dst_addr);
+					 && (ret = rte_hash_lookup(arp_handle, &ipv4h->dst_addr)) >= 0) {
+					rte_ether_addr_copy(&arp_table[ret], &eth->dst_addr);
+				}
 			} 
-			// else if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
-			// 	   arp_process(eth, arp_handle, &eth_tx_port_addr);
-			// }
+			else if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+				   arp_process(eth, arp_handle, &eth_tx_port_addr);
+			}
 
 			/* replace ethernet source address (client -> port1) */
-			// rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
+			rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
 			
-pass:
 			bufs[nb_pass++] = m;
 		}
 
@@ -574,7 +572,7 @@ server2client(__rte_unused void *arg)
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
 	struct rte_mbuf *m;
 	struct rte_ether_hdr *eth;
-	// struct rte_ether_addr eth_tx_port_addr, eth_client_addr;
+	struct rte_ether_addr eth_tx_port_addr;//, eth_client_addr;
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
 	struct rte_hash *arp_handle, *key_handle, *tcp_handle;
@@ -589,9 +587,9 @@ server2client(__rte_unused void *arg)
 	// if (ret != 0)
 	// 	return ret;
 
-	// ret = rte_eth_macaddr_get(0, &eth_tx_port_addr);
-	// if (ret != 0)
-	// 	return ret;
+	ret = rte_eth_macaddr_get(0, &eth_tx_port_addr);
+	if (ret != 0)
+		return ret;
 
 	arp_handle = rte_hash_find_existing(arp_param.name);
 	if (!arp_handle)
@@ -694,22 +692,23 @@ server2client(__rte_unused void *arg)
 
 				DEBUG_PRINTF("%d: cache_table updated %u\n", lcore_id, cache_index);
 				DEBUG_PRINTF("%d: data = '%.*s'\n", lcore_id, entry->data_len, entry->data);
-				
-				// if (!rte_is_broadcast_ether_addr(&eth->dst_addr)
-				// 	) {
-				// 	rte_ether_addr_copy(&eth_client_addr, &eth->dst_addr);				
-				// 	//  && (ret = rte_hash_lookup(arp_handle, &ipv4h->dst_addr)) >= 0) {
-				// 	// rte_ether_addr_copy(&arp_table[ret], &eth->dst_addr);
-				// }
+
+pass:			
+				if (!rte_is_broadcast_ether_addr(&eth->dst_addr)
+					// ) {
+					// rte_ether_addr_copy(&eth_client_addr, &eth->dst_addr);				
+					 && (ret = rte_hash_lookup(arp_handle, &ipv4h->dst_addr)) >= 0) {
+					rte_ether_addr_copy(&arp_table[ret], &eth->dst_addr);
+				}
 
 			} 
-			// else if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
-			// 	arp_process(eth, arp_handle, &eth_tx_port_addr);
-			// }
+			else if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+				arp_process(eth, arp_handle, &eth_tx_port_addr);
+			}
 
 			/* replace ethernet source address (client -> port1) */
-			// rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
-pass:
+			rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
+
 			bufs[nb_pass++] = m;
 		}
 
