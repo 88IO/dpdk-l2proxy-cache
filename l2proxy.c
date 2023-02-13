@@ -31,8 +31,8 @@
 #define MAX_CACHE_DATA_LENGTH 1024
 
 #define KEY_ENTRY_SIZE 512
-#define ARP_ENTRY_SIZE 64
-#define CONN_ENTRY_SIZE 512
+#define ARP_ENTRY_SIZE 128
+#define CONN_ENTRY_SIZE 1024
 
 #define FNV_OFFSET_BASIS_32 2166136261
 #define FNV_PRIME_32 16777619
@@ -97,12 +97,13 @@ struct _stats {
 	uint32_t get_hit;
 	uint32_t get_miss;
 	uint32_t set_hit;
+	uint32_t set_miss;
 	uint32_t arp;
 	uint32_t pass;
 	uint32_t reply;
 	uint32_t error;
 };
-struct _stats stats0, stats1;
+struct _stats stats0, stats1, stats0_prev, stats1_prev;
 
 static struct cache_entry *resp_cache;
 
@@ -177,6 +178,18 @@ enum resp_method {
     SET,
     NONE
 };
+
+static void 
+print_stats() {
+	printf("stats: client --> server\n  pass = %u (set_miss = %u, set_hit = %u, get_miss = %u), reply = %u, error = %u\n",
+			stats0.pass - stats0_prev.pass, stats0.set_miss - stats0_prev.set_miss, 
+			stats0.set_hit - stats0_prev.set_hit, stats0.get_miss - stats0_prev.get_miss,
+			stats0.reply - stats0_prev.reply, stats0.error - stats0_prev.error);
+	printf("stats: client <-- server\n  pass = %u, reply = %u, error = %u\n",
+			stats1.pass - stats1_prev.pass, stats1.reply - stats1_prev.reply, stats1.error - stats1_prev.error);
+	stats0_prev = stats0;
+	stats1_prev = stats1;
+}
 
 /*
  * Initializes a given port using global settings and with the RX buffers
@@ -372,7 +385,7 @@ client2server(__rte_unused void *arg)
 					goto pass;
 
 				tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
-				ts = (struct tcp_timestamp *)(tcph + 1);
+				//ts = (struct tcp_timestamp *)(tcph + 1);
 
 				if (tcph->dst_port != rte_cpu_to_be_16(6379))
 					goto pass;	
@@ -386,7 +399,7 @@ client2server(__rte_unused void *arg)
 				seq_uniq.client_port = tcph->src_port;
 
 				sig = rte_hash_hash(tcp_handle, &seq_uniq);
-				if (tcph->tcp_flags & RTE_TCP_FIN_FLAG) {
+				if (tcph->tcp_flags & (RTE_TCP_FIN_FLAG | RTE_TCP_SYN_FLAG)) {
 					ret = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
 				}
 				if ((ret_hit = rte_hash_lookup_with_hash(tcp_handle, &seq_uniq, sig)) >= 0) {
@@ -450,6 +463,8 @@ client2server(__rte_unused void *arg)
 
 						if (ret_hit < 0 && (ret_hit = rte_hash_add_key(tcp_handle, &seq_uniq)) >= 0) {
 							hit_info = &tcp_table[ret_hit];
+							hit_info->recv_bytes = 0;
+							hit_info->send_bytes = 0;
 						}
 						hit_info->recv_bytes += payload_len;
 						hit_info->send_bytes += entry->data_len;
@@ -459,11 +474,11 @@ client2server(__rte_unused void *arg)
 						RTE_SWAP(eth->src_addr, eth->dst_addr);
 						RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
 						RTE_SWAP(tcph->src_port, tcph->dst_port);
-						if (likely(ts->kind == 8)) {
-							rte_be32_t tmp_val = ts->ecr;
-							ts->ecr = ts->val;
-							ts->val = rte_cpu_to_be_32(rte_be_to_cpu_32(tmp_val) + 1);
-						}
+						// if (likely(ts->kind == 8)) {
+						// 	rte_be32_t tmp_val = ts->ecr;
+						// 	ts->ecr = ts->val;
+						// 	ts->val = rte_cpu_to_be_32(rte_be_to_cpu_32(tmp_val) + 1);
+						// }
 						ipv4h->total_length = rte_cpu_to_be_16(
 							rte_be_to_cpu_16(ipv4h->total_length) + payload_len_diff);
 
@@ -510,6 +525,9 @@ client2server(__rte_unused void *arg)
 					if (entry->valid && key_hash == entry->hash
 							&& !strncmp(pos, entry->key, key_len)) {
 						entry->valid = false;
+						stats0.set_hit++;
+					} else {
+						stats0.set_miss++;
 					}
 					break;
 				default:
@@ -568,8 +586,8 @@ static int
 server2client(__rte_unused void *arg)
 {
 	int ret, ret_hit;
-	uint32_t lcore_id, nb_reply, nb_pass, sig, cache_index, payload_len;
-	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
+	uint32_t lcore_id, sig, cache_index, payload_len;//nb_reply, nb_pass, 
+	struct rte_mbuf *bufs[BURST_SIZE];//, *bufs_reply[BURST_SIZE];
 	struct rte_mbuf *m;
 	struct rte_ether_hdr *eth;
 	struct rte_ether_addr eth_tx_port_addr;//, eth_client_addr;
@@ -613,7 +631,7 @@ server2client(__rte_unused void *arg)
 		if (unlikely(nb_rx == 0))
 			continue;
 
-		nb_reply = nb_pass = 0;
+		//nb_reply = nb_pass = 0;
 
 		//printf("lcore %u: rx (%u pkts) from queue %u\n", lcore_id, nb_rx, queue_id);
 
@@ -631,6 +649,9 @@ server2client(__rte_unused void *arg)
 				
 				tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
 
+				if (tcph->dst_port == rte_cpu_to_be_16(10000))
+					print_stats();
+
 				if (tcph->src_port != rte_cpu_to_be_16(6379))
 					goto pass;				
 
@@ -643,14 +664,6 @@ server2client(__rte_unused void *arg)
 				seq_uniq.client_port = tcph->dst_port;
 				
 				if ((ret_hit = rte_hash_lookup(tcp_handle, &seq_uniq)) >= 0) {
-					// if (payload_len == 0 && !(tcph->tcp_flags & (RTE_TCP_SYN_FLAG | RTE_TCP_FIN_FLAG))) {
-					// 	RTE_SWAP(eth->src_addr, eth->dst_addr);
-					// 	RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
-					// 	RTE_SWAP(tcph->src_port, tcph->dst_port);
-					// 	RTE_SWAP(tcph->sent_seq, tcph->recv_ack);
-					// 	bufs_reply[nb_reply++] = m;
-					// 	continue;
-					// }
 					hit_info = &tcp_table[ret_hit];
 					tcph->sent_seq = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) + hit_info->send_bytes);
 					tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->recv_ack) + hit_info->recv_bytes);
@@ -709,26 +722,26 @@ pass:
 			/* replace ethernet source address (client -> port1) */
 			rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
 
-			bufs[nb_pass++] = m;
+			//bufs[nb_pass++] = m;
 		}
 
-		/* Send burst of TX packets, to second port of pair. */
-		const uint16_t nb_tx1 = rte_eth_tx_burst(PORT1, 1, bufs_reply, nb_reply);
-		stats1.reply += nb_tx1;
-		/* Free any unsent packets. */
-		if (unlikely(nb_tx1 < nb_reply)) {
-			rte_pktmbuf_free_bulk(&bufs_reply[nb_tx1], nb_reply - nb_tx1);
-		}
+		// /* Send burst of TX packets, to second port of pair. */
+		// const uint16_t nb_tx1 = rte_eth_tx_burst(PORT1, 1, bufs_reply, nb_reply);
+		// stats1.reply += nb_tx1;
+		// /* Free any unsent packets. */
+		// if (unlikely(nb_tx1 < nb_reply)) {
+		// 	rte_pktmbuf_free_bulk(&bufs_reply[nb_tx1], nb_reply - nb_tx1);
+		// }
 
 		/* Send burst of TX packets, to first port of pair. */
-		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT0, 0, bufs, nb_pass);
+		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT0, 0, bufs, nb_rx);
 		stats1.pass += nb_tx0;
 		/* Free any unsent packets. */
-		if (unlikely(nb_tx0 < nb_pass)) {
-			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_pass - nb_tx0);
+		if (unlikely(nb_tx0 < nb_rx)) {
+			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_rx - nb_tx0);
 		}
 
-		stats1.error += nb_rx - nb_tx0 - nb_tx1;
+		stats1.error += nb_rx - nb_tx0;
 	}
 
 	return 0;
@@ -738,10 +751,10 @@ static void
 signal_handler(int signum)
 {
 	if (signum == SIGINT || signum == SIGTERM) {
-		printf("\n\nSignal %d received, preparing to exit...\n",
-				signum);
-		printf("stats: client --> server\n  pass = %u (get_miss = %u), reply = %u, error = %u\n",
-				stats0.pass, stats0.get_miss, stats0.reply, stats0.error);
+		printf("stats: client --> server\n  pass = %u (set_miss = %u, set_hit = %u, get_miss = %u), reply = %u, error = %u\n",
+				stats0.pass, stats0.set_miss, 
+				stats0.set_hit, stats0.get_miss,
+				stats0.reply, stats0.error);
 		printf("stats: client <-- server\n  pass = %u, reply = %u, error = %u\n",
 				stats1.pass, stats1.reply, stats1.error);
 		force_quit = true;
