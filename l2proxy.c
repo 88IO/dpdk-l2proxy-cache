@@ -26,7 +26,7 @@
 #define PORT0 0
 #define PORT1 1
 
-#define CACHE_ENTRY_SIZE 8096
+#define CACHE_ENTRY_SIZE 8192
 #define RESP_MAX_KEY_LENGTH 256
 #define MAX_CACHE_DATA_LENGTH 1024
 
@@ -200,20 +200,25 @@ print_stats() {
 static inline int
 port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 {
-	struct rte_eth_conf port_conf;
 	const uint16_t rx_rings = 1, tx_rings = 2;
 	uint16_t nb_rxd = RX_RING_SIZE;
 	uint16_t nb_txd = TX_RING_SIZE;
 	int retval;
 	uint16_t q;
-	struct rte_eth_dev_info dev_info;
+	struct rte_eth_conf port_conf = {
+		.txmode = {
+			.offloads =
+				RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
+				RTE_ETH_TX_OFFLOAD_TCP_CKSUM
+				//RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE
+		}
+	};
 	struct rte_eth_txconf txconf;
 	struct rte_eth_rxconf rxconf;
+	struct rte_eth_dev_info dev_info;
 
 	if (!rte_eth_dev_is_valid_port(port))
 		return -1;
-
-	memset(&port_conf, 0, sizeof(struct rte_eth_conf));
 
 	retval = rte_eth_dev_info_get(port, &dev_info);
 	if (retval != 0) {
@@ -222,9 +227,14 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 		return retval;
 	}
 
-	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
-		port_conf.txmode.offloads |=
-			RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+	// printf("RTE_ETH_TX_OFFLOAD_IPV4_CKSUM = %lu\n", dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM);
+	// printf("RTE_ETH_TX_OFFLOAD_TCP_CKSUM = %lu\n", dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM);
+
+	// if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+	// 	port_conf.txmode.offloads |=
+	// 		RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+	port_conf.txmode.offloads &= dev_info.tx_offload_capa;
 
 	/* Configure the Ethernet device. */
 	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
@@ -292,6 +302,22 @@ determine_method(char *payload)  {
         return SET;
     
     return NONE;
+}
+
+static inline uint32_t 
+csum32_add(uint32_t a, uint32_t b) {
+	//printf("32: a = %x, b = %x, ", a, b);
+	a += b;
+	//printf("a + b = %x\n", a + (a < b));
+	return a + (a < b);
+}
+
+static inline uint16_t 
+csum16_add(uint16_t a, uint16_t b) {
+	//printf("16: a = %x, b = %x, ", a, b);
+	a += b;
+	//printf("a + b = %x\n", a + (a < b));
+	return a + (a < b);
 }
 
 static inline void
@@ -387,6 +413,14 @@ client2server(__rte_unused void *arg)
 				tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
 				//ts = (struct tcp_timestamp *)(tcph + 1);
 
+				if (tcph->dst_port == rte_cpu_to_be_16(10000)) {
+					print_stats();
+					// for (int i = 0; i < CACHE_ENTRY_SIZE; i++) {
+					// 	if (resp_cache[i].valid)
+					// 		printf("%u: %.*s\n", i, resp_cache[i].data_len, resp_cache[i].data);
+					// }
+				}
+
 				if (tcph->dst_port != rte_cpu_to_be_16(6379))
 					goto pass;	
 
@@ -405,15 +439,6 @@ client2server(__rte_unused void *arg)
 				if ((ret_hit = rte_hash_lookup_with_hash(tcp_handle, &seq_uniq, sig)) >= 0) {
 					hit_info = &tcp_table[ret_hit];
 				};
-
-				// if (ret_hit >= 0 && payload_len == 0 && !(tcph->tcp_flags & (RTE_TCP_SYN_FLAG | RTE_TCP_FIN_FLAG))) {
-				// 	RTE_SWAP(eth->src_addr, eth->dst_addr);
-				// 	RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
-				// 	RTE_SWAP(tcph->src_port, tcph->dst_port);
-				// 	RTE_SWAP(tcph->sent_seq, tcph->recv_ack);
-				// 	bufs_reply[nb_reply++] = m;
-				// 	continue;
-				// }
 
 				if (payload_len == 0) 
 					goto resp;
@@ -438,6 +463,7 @@ client2server(__rte_unused void *arg)
 				DEBUG_PRINTF("%d: cache_table lookup [%u]\n", lcore_id, cache_index);
 
 				entry = &resp_cache[cache_index];
+				//printf("%.*s,%u\n", key_len, pos, cache_index);
 				
 				switch (resp_m) {
 				case GET:
@@ -483,23 +509,30 @@ client2server(__rte_unused void *arg)
 							rte_be_to_cpu_16(ipv4h->total_length) + payload_len_diff);
 
 						ipv4h->hdr_checksum = 0;
-						ipv4h->hdr_checksum = rte_ipv4_cksum(ipv4h);
+						// ipv4h->hdr_checksum = rte_ipv4_cksum(ipv4h);
 
 						u_int32_t new_seq = tcph->recv_ack;
 						tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) + payload_len);
 						tcph->sent_seq = new_seq;
 
-						tcph->cksum = 0;
-						tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
-				
+						// tcph->cksum = 0;
+						// tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
+						uint32_t pseudo_cksum = csum32_add(
+							csum32_add(ipv4h->src_addr, ipv4h->dst_addr),
+							(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(rte_be_to_cpu_16(ipv4h->total_length) - (ipv4h->ihl << 2))
+						);
+						tcph->cksum = csum16_add(pseudo_cksum & 0xFFFF, pseudo_cksum >> 16);
+
+						m->l2_len = sizeof(struct rte_ether_hdr);
+						m->l3_len = sizeof(struct rte_ipv4_hdr);
+						m->ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM);
+
 						bufs_reply[nb_reply++] = m;
 						continue;
 
 					} else {
 						DEBUG_PRINTF("%d: GET MISS hook.\n", lcore_id);
-						// seq_uniq.client_addr = ipv4h->src_addr;
-						// seq_uniq.server_addr = ipv4h->dst_addr;
-						// seq_uniq.client_port = tcph->src_port;
+
 						seq_uniq.seq = tcph->recv_ack;
 
 						if ((ret = rte_hash_add_key(key_handle, &seq_uniq)) >= 0) {
@@ -536,10 +569,14 @@ client2server(__rte_unused void *arg)
 
 resp:
 				if (ret_hit >= 0) {
+					uint32_t csum32 = ~tcph->cksum & 0xFFFF;
+					csum32 = csum32_add(csum32_add(csum32, ~tcph->sent_seq), ~tcph->recv_ack);
 					tcph->sent_seq = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) - hit_info->recv_bytes);
 					tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->recv_ack) - hit_info->send_bytes);
-					tcph->cksum = 0;
-					tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
+					csum32 = csum32_add(csum32_add(csum32, tcph->sent_seq), tcph->recv_ack);
+					tcph->cksum = ~csum16_add(csum32 & 0xFFFF, csum32 >> 16);
+					// tcph->cksum = 0;
+					// tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
 				}
 			
 pass:			
@@ -557,6 +594,7 @@ pass:
 			/* replace ethernet source address (client -> port1) */
 			rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
 			
+			//m->ol_flags |= RTE_MBUF_F_TX_L4_NO_CKSUM;
 			bufs[nb_pass++] = m;
 		}
 
@@ -649,9 +687,6 @@ server2client(__rte_unused void *arg)
 				
 				tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
 
-				if (tcph->dst_port == rte_cpu_to_be_16(10000))
-					print_stats();
-
 				if (tcph->src_port != rte_cpu_to_be_16(6379))
 					goto pass;				
 
@@ -665,10 +700,14 @@ server2client(__rte_unused void *arg)
 				
 				if ((ret_hit = rte_hash_lookup(tcp_handle, &seq_uniq)) >= 0) {
 					hit_info = &tcp_table[ret_hit];
+					uint32_t csum32 = ~tcph->cksum & 0xFFFF;
+					csum32 = csum32_add(csum32_add(csum32, ~tcph->sent_seq), ~tcph->recv_ack);
 					tcph->sent_seq = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) + hit_info->send_bytes);
 					tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->recv_ack) + hit_info->recv_bytes);
-					tcph->cksum = 0;
-					tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
+					csum32 = csum32_add(csum32_add(csum32, tcph->sent_seq), tcph->recv_ack);
+					tcph->cksum = ~csum16_add(csum32 & 0xFFFF, csum32 >> 16);
+					// tcph->cksum = 0;
+					// tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
 				};
 
 				if (payload_len == 0 || payload[0] != '$')
