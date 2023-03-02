@@ -48,8 +48,6 @@
 # define DEBUG_PRINTF(fmt, ...)
 #endif
 
-static volatile bool force_quit;
-
 struct tcp_key {
 	rte_be32_t client_addr;
 	rte_be32_t server_addr;
@@ -57,34 +55,21 @@ struct tcp_key {
 };
 
 struct sequence_unique {
-	rte_be32_t client_addr;
-	rte_be32_t server_addr;
-	rte_be16_t client_port;
+	struct tcp_key tcp_key;
 	rte_be16_t server_port;
 	rte_be32_t seq;
 };
 
-struct tcp_timestamp {
-	uint8_t no_operation[2];
-	uint8_t kind;
-	uint8_t length;
-	rte_be32_t val;
-	rte_be32_t ecr;
+struct cache_key {
+	uint32_t hash;
+	uint32_t len;
+	char data[RESP_MAX_KEY_LENGTH];
 };
 
 struct cache_entry {
-	uint32_t key_len;
-	uint32_t data_len;
-	uint32_t hash;
+	struct rte_mbuf *m_data;
+	struct cache_key key;
 	bool valid;
-	char key[RESP_MAX_KEY_LENGTH];
-	char data[MAX_CACHE_DATA_LENGTH];
-};
-
-struct cache_key {
-	uint32_t hash;
-	uint32_t key_len;
-	char key[RESP_MAX_KEY_LENGTH];
 };
 
 struct tcp_info {
@@ -103,9 +88,6 @@ struct _stats {
 	uint32_t reply;
 	uint32_t error;
 };
-struct _stats stats0, stats1, stats0_prev, stats1_prev;
-
-static struct cache_entry *resp_cache;
 
 static inline uint32_t
 fnv_hash(const char *key, uint32_t length, uint32_t initval) 
@@ -149,8 +131,6 @@ static struct rte_hash_parameters key_param = {
 	.socket_id = 0,
 };
 
-static struct cache_key key_table[CACHE_ENTRY_SIZE];
-
 static struct rte_hash_parameters arp_param = {
 	.name = "arp_table",
 	.entries = ARP_ENTRY_SIZE,
@@ -159,8 +139,6 @@ static struct rte_hash_parameters arp_param = {
 	.hash_func_init_val = 0,
 	.socket_id = 0,
 };
-
-static struct rte_ether_addr arp_table[ARP_ENTRY_SIZE];
 
 static struct rte_hash_parameters tcp_param = {
 	.name = "tcp_info",
@@ -171,13 +149,21 @@ static struct rte_hash_parameters tcp_param = {
 	.socket_id = 0,
 };
 
-static struct tcp_info tcp_table[CONN_ENTRY_SIZE];
-
 enum resp_method {
     GET,
     SET,
     NONE
 };
+
+static volatile bool force_quit;
+
+static struct _stats stats0, stats1, stats0_prev, stats1_prev;
+
+static struct cache_entry *resp_cache;
+
+static struct rte_ether_addr arp_table[ARP_ENTRY_SIZE];
+static struct cache_key key_table[CACHE_ENTRY_SIZE];
+static struct tcp_info tcp_table[CONN_ENTRY_SIZE];
 
 static void 
 print_stats() {
@@ -207,10 +193,10 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	uint16_t q;
 	struct rte_eth_conf port_conf = {
 		.txmode = {
+			.mq_mode = RTE_ETH_MQ_TX_NONE,
 			.offloads =
 				RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
 				RTE_ETH_TX_OFFLOAD_TCP_CKSUM
-				//RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE
 		}
 	};
 	struct rte_eth_txconf txconf;
@@ -226,13 +212,14 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 				port, strerror(-retval));
 		return retval;
 	}
+	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS)
+		printf("RTE_ETH_TX_OFFLOAD_MULTI_SEGS = %d\n", 
+			!!(port_conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_MULTI_SEGS));
 
-	// printf("RTE_ETH_TX_OFFLOAD_IPV4_CKSUM = %lu\n", dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM);
-	// printf("RTE_ETH_TX_OFFLOAD_TCP_CKSUM = %lu\n", dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM);
-
-	// if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
-	// 	port_conf.txmode.offloads |=
-	// 		RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+	if (!(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)
+	    || !(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) {
+		return -1;
+	}
 
 	port_conf.txmode.offloads &= dev_info.tx_offload_capa;
 
@@ -277,8 +264,7 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	if (retval != 0)
 		return retval;
 
-	printf("Port %u MAC: %02" PRIx8 ":%02" PRIx8 ":%02" PRIx8
-			   ":%02" PRIx8 ":%02" PRIx8 ":%02"PRIx8 "\n",
+	printf("Port %u MAC: %2x:%2x:%2x:%2x:%2x:%2x\n",
 			port, RTE_ETHER_ADDR_BYTES(&addr));
 
 	/* Enable RX in promiscuous mode for the Ethernet device. */
@@ -289,7 +275,6 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 
 	return 0;
 }
-/* >8 End of main functional part of port initialization. */
 
 static inline enum resp_method 
 determine_method(char *payload)  {
@@ -347,7 +332,7 @@ arp_process(struct rte_ether_hdr *eth, struct rte_hash *arp_handle, struct rte_e
 static int
 client2server(__rte_unused void *arg)
 {
-	int ret, ret_hit, payload_len_diff;
+	int ret, ret_hit;
 	uint32_t lcore_id, nb_reply, nb_pass, sig, key_len, key_hash, cache_index, payload_len;
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
 	struct rte_mbuf *m;
@@ -355,7 +340,6 @@ client2server(__rte_unused void *arg)
 	struct rte_ether_addr eth_tx_port_addr; //, eth_server_addr;
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
-	struct tcp_timestamp *ts;
 	char *pos, *payload;
 	struct rte_hash *arp_handle, *key_handle, *tcp_handle;
 	enum resp_method resp_m;
@@ -411,26 +395,23 @@ client2server(__rte_unused void *arg)
 					goto pass;
 
 				tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
-				//ts = (struct tcp_timestamp *)(tcph + 1);
 
+#ifdef DEBUG_STATS
 				if (tcph->dst_port == rte_cpu_to_be_16(10000)) {
 					print_stats();
-					// for (int i = 0; i < CACHE_ENTRY_SIZE; i++) {
-					// 	if (resp_cache[i].valid)
-					// 		printf("%u: %.*s\n", i, resp_cache[i].data_len, resp_cache[i].data);
-					// }
 				}
+#endif
 
 				if (tcph->dst_port != rte_cpu_to_be_16(6379))
 					goto pass;	
 
-				pos = payload = ((void *)tcph + (tcph->data_off >> 2));
+				pos = payload = (void *)tcph + (tcph->data_off >> 2);
 
-				payload_len = rte_pktmbuf_data_len(m) + (void*)eth - (void*)payload;
+				payload_len = m->data_len + (void*)eth - (void*)payload;
 
-				seq_uniq.client_addr = ipv4h->src_addr;
-				seq_uniq.server_addr = ipv4h->dst_addr;
-				seq_uniq.client_port = tcph->src_port;
+				seq_uniq.tcp_key.client_addr = ipv4h->src_addr;
+				seq_uniq.tcp_key.server_addr = ipv4h->dst_addr;
+				seq_uniq.tcp_key.client_port = tcph->src_port;
 
 				sig = rte_hash_hash(tcp_handle, &seq_uniq);
 				if (tcph->tcp_flags & (RTE_TCP_FIN_FLAG | RTE_TCP_SYN_FLAG)) {
@@ -449,10 +430,10 @@ client2server(__rte_unused void *arg)
 				pos += 13;
 
 				if (*pos++ != '$')
-					goto pass;
+					goto resp;
 
 				if ((key_len = (uint32_t)strtol(pos, &pos, 10)) <= 0)
-					goto pass;
+					goto resp;
 
 				// skip "/r/n"
 				pos += 2;
@@ -471,21 +452,17 @@ client2server(__rte_unused void *arg)
 						entry->valid, entry->hash, entry->key_len, entry->key);
 					DEBUG_PRINTF("      hash = %u,        key = %.*s\n",
 						key_hash, key_len, pos);
-					if (entry->valid && key_hash == entry->hash
-							&& !strncmp(pos, entry->key, key_len)) {
+					if (entry->valid && key_hash == entry->key.hash
+							&& !strncmp(pos, entry->key.data, key_len)) {
 						DEBUG_PRINTF("%d: GET HIT hook.\n", lcore_id);
 
-						payload_len_diff = entry->data_len - payload_len;
-						if (payload_len_diff > 0) {
-							if (unlikely(rte_pktmbuf_append(m, payload_len_diff) == NULL))
-								goto pass;
-						}
-						else {
-							if (unlikely(rte_pktmbuf_trim(m, -payload_len_diff)))
-								goto pass;
-						}
-
-						DEBUG_PRINTF("reply\n");
+						if (unlikely(rte_pktmbuf_trim(m, payload_len)))
+							goto pass;
+						
+						rte_pktmbuf_refcnt_update(entry->m_data, 1);
+						m->next = entry->m_data;
+						m->pkt_len += entry->m_data->pkt_len;
+						m->nb_segs = entry->m_data->nb_segs + 1;
 
 						if (ret_hit < 0 && (ret_hit = rte_hash_add_key(tcp_handle, &seq_uniq)) >= 0) {
 							hit_info = &tcp_table[ret_hit];
@@ -493,9 +470,7 @@ client2server(__rte_unused void *arg)
 							hit_info->send_bytes = 0;
 						}
 						hit_info->recv_bytes += payload_len;
-						hit_info->send_bytes += entry->data_len;
-
-						rte_memcpy(payload, entry->data, entry->data_len);
+						hit_info->send_bytes += entry->m_data->data_len;
 
 						RTE_SWAP(eth->src_addr, eth->dst_addr);
 						RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
@@ -505,18 +480,14 @@ client2server(__rte_unused void *arg)
 						// 	ts->ecr = ts->val;
 						// 	ts->val = rte_cpu_to_be_32(rte_be_to_cpu_32(tmp_val) + 1);
 						// }
-						ipv4h->total_length = rte_cpu_to_be_16(
-							rte_be_to_cpu_16(ipv4h->total_length) + payload_len_diff);
+						ipv4h->total_length = rte_cpu_to_be_16(m->pkt_len - sizeof(struct rte_ether_hdr));
 
 						ipv4h->hdr_checksum = 0;
-						// ipv4h->hdr_checksum = rte_ipv4_cksum(ipv4h);
 
 						u_int32_t new_seq = tcph->recv_ack;
 						tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) + payload_len);
 						tcph->sent_seq = new_seq;
 
-						// tcph->cksum = 0;
-						// tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
 						uint32_t pseudo_cksum = csum32_add(
 							csum32_add(ipv4h->src_addr, ipv4h->dst_addr),
 							(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(rte_be_to_cpu_16(ipv4h->total_length) - (ipv4h->ihl << 2))
@@ -535,28 +506,30 @@ client2server(__rte_unused void *arg)
 
 						seq_uniq.seq = tcph->recv_ack;
 
-						if ((ret = rte_hash_add_key(key_handle, &seq_uniq)) >= 0) {
+						sig = rte_hash_hash(key_handle, &seq_uniq);
+						if ((ret = rte_hash_add_key_with_hash(key_handle, &seq_uniq, sig)) >= 0) {
 							struct cache_key *ck = &key_table[ret];
 							ck->hash = key_hash;
-							ck->key_len = key_len;
-							rte_memcpy(ck->key, pos, key_len);
+							ck->len = key_len;
+							rte_memcpy(ck->data, pos, key_len);
 
 							DEBUG_PRINTF("%d: add key_info:\n", lcore_id);
-							DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.client_addr);
-							DEBUG_PRINTF("      server_addr = %u\n", seq_uniq.server_addr);
+							DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.tcp_key.client_addr);
+							DEBUG_PRINTF("      server_addr = %u\n", seq_uniq.tcp_key.server_addr);
 							DEBUG_PRINTF("      seq = %u\n", seq_uniq.seq);
-							DEBUG_PRINTF("      client_port = %u\n", seq_uniq.client_port);
+							DEBUG_PRINTF("      client_port = %u\n", seq_uniq.tcp_key.client_port);
+						} else {
+							printf("failed to add key\n");
 						}
-						uint32_t sig = rte_hash_hash(key_handle, &seq_uniq);
-						DEBUG_PRINTF("%d: %u\n", lcore_id, sig);
+
 						stats0.get_miss++;
 						//printf("%.*s = %u (%u)\n", key_len, pos, key_hash, cache_index); 
 					}	
 					break;
 				case SET:
 					DEBUG_PRINTF("%d: SET hook.\n", lcore_id);
-					if (entry->valid && key_hash == entry->hash
-							&& !strncmp(pos, entry->key, key_len)) {
+					if (entry->valid && key_hash == entry->key.hash
+							&& !strncmp(pos, entry->key.data, key_len)) {
 						entry->valid = false;
 						stats0.set_hit++;
 					} else {
@@ -621,11 +594,12 @@ pass:
 }
 
 static int
-server2client(__rte_unused void *arg)
+server2client(void *arg)
 {
+	struct rte_mempool *clone_pool = arg;
 	int ret, ret_hit;
-	uint32_t lcore_id, sig, cache_index, payload_len;//nb_reply, nb_pass, 
-	struct rte_mbuf *bufs[BURST_SIZE];//, *bufs_reply[BURST_SIZE];
+	uint32_t lcore_id, sig, cache_index, payload_len; 
+	struct rte_mbuf *bufs[BURST_SIZE], *bufs_clone[BURST_SIZE];
 	struct rte_mbuf *m;
 	struct rte_ether_hdr *eth;
 	struct rte_ether_addr eth_tx_port_addr;//, eth_client_addr;
@@ -669,8 +643,6 @@ server2client(__rte_unused void *arg)
 		if (unlikely(nb_rx == 0))
 			continue;
 
-		//nb_reply = nb_pass = 0;
-
 		//printf("lcore %u: rx (%u pkts) from queue %u\n", lcore_id, nb_rx, queue_id);
 
 		for (uint16_t j = 0; j < nb_rx; j++) {
@@ -694,9 +666,9 @@ server2client(__rte_unused void *arg)
 
 				payload_len = rte_pktmbuf_data_len(m) + (void*)eth - (void*)payload;
 
-				seq_uniq.client_addr = ipv4h->dst_addr;
-				seq_uniq.server_addr = ipv4h->src_addr;
-				seq_uniq.client_port = tcph->dst_port;
+				seq_uniq.tcp_key.client_addr = ipv4h->dst_addr;
+				seq_uniq.tcp_key.server_addr = ipv4h->src_addr;
+				seq_uniq.tcp_key.client_port = tcph->dst_port;
 				
 				if ((ret_hit = rte_hash_lookup(tcp_handle, &seq_uniq)) >= 0) {
 					hit_info = &tcp_table[ret_hit];
@@ -716,10 +688,10 @@ server2client(__rte_unused void *arg)
 				seq_uniq.seq = tcph->sent_seq;
 
 				DEBUG_PRINTF("%d: lookup key_info:\n", lcore_id);
-				DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.client_addr);
-				DEBUG_PRINTF("      server_addr = %u\n", seq_uniq.server_addr);
+				DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.tcp_key.client_addr);
+				DEBUG_PRINTF("      server_addr = %u\n", seq_uniq.tcp_key.server_addr);
 				DEBUG_PRINTF("      seq = %u\n", seq_uniq.seq);
-				DEBUG_PRINTF("      client_port = %u\n", seq_uniq.client_port);
+				DEBUG_PRINTF("      client_port = %u\n", seq_uniq.tcp_key.client_port);
 
 				sig = rte_hash_hash(key_handle, &seq_uniq);
 				DEBUG_PRINTF("%d: %u\n", lcore_id, sig);
@@ -732,18 +704,26 @@ server2client(__rte_unused void *arg)
 
 				entry = &resp_cache[cache_index];
 
-				entry->key_len = ck->key_len;
-				entry->data_len = payload_len;
-				entry->hash = ck->hash;
-				rte_memcpy(entry->key, ck->key, ck->key_len);
-				rte_memcpy(entry->data, payload, payload_len);
+				if ((bufs[j] = rte_pktmbuf_clone(m, clone_pool)) == NULL)
+					printf("%d: failed to clone mbuf\n", lcore_id);
+		
+				if (rte_pktmbuf_adj(m, (void*)payload - (void*)eth) == NULL)
+					printf("%d: failed to adjust packet.\n", lcore_id);
+
+				entry->key.len = ck->len;
+				//entry->data_len = payload_len;
+				entry->key.hash = ck->hash;
+				rte_memcpy(entry->key.data, ck->data, ck->len);
+				rte_pktmbuf_free(entry->m_data);
+				//rte_memcpy(entry->data, payload, payload_len);
+				entry->m_data = m;
 				entry->valid = true;
 
 				ret = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
 				//rte_hash_free_key_with_position(key_handle, ret);
 
 				DEBUG_PRINTF("%d: cache_table updated %u\n", lcore_id, cache_index);
-				DEBUG_PRINTF("%d: data = '%.*s'\n", lcore_id, entry->data_len, entry->data);
+				DEBUG_PRINTF("%d: data = '%.*s'\n", lcore_id, entry->m_data->data_len, (char*)entry->m_data->buf_addr);
 
 pass:			
 				if (!rte_is_broadcast_ether_addr(&eth->dst_addr)
@@ -760,21 +740,12 @@ pass:
 
 			/* replace ethernet source address (client -> port1) */
 			rte_ether_addr_copy(&eth_tx_port_addr, &eth->src_addr);
-
-			//bufs[nb_pass++] = m;
 		}
-
-		// /* Send burst of TX packets, to second port of pair. */
-		// const uint16_t nb_tx1 = rte_eth_tx_burst(PORT1, 1, bufs_reply, nb_reply);
-		// stats1.reply += nb_tx1;
-		// /* Free any unsent packets. */
-		// if (unlikely(nb_tx1 < nb_reply)) {
-		// 	rte_pktmbuf_free_bulk(&bufs_reply[nb_tx1], nb_reply - nb_tx1);
-		// }
 
 		/* Send burst of TX packets, to first port of pair. */
 		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT0, 0, bufs, nb_rx);
 		stats1.pass += nb_tx0;
+
 		/* Free any unsent packets. */
 		if (unlikely(nb_tx0 < nb_rx)) {
 			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_rx - nb_tx0);
@@ -800,17 +771,6 @@ signal_handler(int signum)
 	}
 }
 
-static int
-dummy_func(__rte_unused void *arg)
-{
-	unsigned lcore_id = rte_lcore_id();
-	if (lcore_id % 2 == 0)
-		client2server(NULL);
-	else
-		server2client(NULL);
-	
-	return 0;
-}
 /*
  * The main function, which does initialization and calls the per-lcore
  * functions.
@@ -818,7 +778,7 @@ dummy_func(__rte_unused void *arg)
 int
 main(int argc, char *argv[])
 {
-	struct rte_mempool *mbuf_pool;
+	struct rte_mempool *mbuf_pool, *clone_pool;
 	unsigned nb_ports;
 	uint16_t portid;
 	struct rte_hash *handle;
@@ -852,9 +812,11 @@ main(int argc, char *argv[])
 	/* Allocates mempool to hold the mbufs. 8< */
 	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,
 		MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+
+	clone_pool = rte_pktmbuf_pool_create("CLONE_POOL", TX_RING_SIZE + BURST_SIZE, BURST_SIZE, 0, 0, rte_socket_id());
 	/* >8 End of allocating mempool to hold mbuf. */
 
-	if (mbuf_pool == NULL)
+	if (mbuf_pool == NULL || clone_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
 	/* Initializing all ports. 8< */
@@ -885,16 +847,7 @@ main(int argc, char *argv[])
 	
 	resp_cache = calloc(CACHE_ENTRY_SIZE, sizeof(struct cache_entry));
 
-	// worker lcore
-	// RTE_LCORE_FOREACH_WORKER(lcoreid) {
-	// 	if (lcoreid % 2 == 0) {
-	// 		rte_eal_remote_launch(client2server, NULL, lcoreid);
-	// 	} else {
-	// 		rte_eal_remote_launch(server2client, NULL, lcoreid);
-	// 	}
-	// }
-	//rte_eal_mp_remote_launch(dummy_func, NULL, CALL_MAIN);
-	rte_eal_remote_launch(server2client, NULL, rte_get_next_lcore(-1, 1, 0));
+	rte_eal_remote_launch(server2client, clone_pool, rte_get_next_lcore(-1, 1, 0));
 
 	/* Call lcore_main on the main core only. Called on single lcore. 8< */
 	client2server(NULL);
