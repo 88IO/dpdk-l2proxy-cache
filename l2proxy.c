@@ -68,7 +68,8 @@ struct cache_key {
 
 struct cache_entry {
 	struct rte_mbuf *m_data;
-	struct cache_key key;
+	//struct cache_key key;
+	uint32_t key_off;
 	bool valid;
 };
 
@@ -129,6 +130,7 @@ static struct rte_hash_parameters key_param = {
 	.hash_func = jhash_tcp_key,
 	.hash_func_init_val = 0,
 	.socket_id = 0,
+	.extra_flag = RTE_HASH_EXTRA_FLAGS_NO_FREE_ON_DEL
 };
 
 static struct rte_hash_parameters arp_param = {
@@ -159,10 +161,12 @@ static volatile bool force_quit;
 
 static struct _stats stats0, stats1, stats0_prev, stats1_prev;
 
+struct rte_hash *arp_handle, *key_handle, *tcp_handle;
+
 static struct cache_entry *resp_cache;
 
 static struct rte_ether_addr arp_table[ARP_ENTRY_SIZE];
-static struct cache_key key_table[CACHE_ENTRY_SIZE];
+static struct cache_key key_table[CACHE_ENTRY_SIZE + CONN_ENTRY_SIZE];
 static struct tcp_info tcp_table[CONN_ENTRY_SIZE];
 
 static void 
@@ -306,7 +310,7 @@ csum16_add(uint16_t a, uint16_t b) {
 }
 
 static inline void
-arp_process(struct rte_ether_hdr *eth, struct rte_hash *arp_handle, struct rte_ether_addr *src_addr) {
+arp_process(struct rte_ether_hdr *eth, struct rte_ether_addr *src_addr) {
 	int ret;
 	struct rte_arp_hdr *arp;
 
@@ -341,7 +345,6 @@ client2server(__rte_unused void *arg)
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
 	char *pos, *payload;
-	struct rte_hash *arp_handle, *key_handle, *tcp_handle;
 	enum resp_method resp_m;
 	struct cache_entry *entry;
 	struct sequence_unique seq_uniq = {
@@ -356,18 +359,6 @@ client2server(__rte_unused void *arg)
 	ret = rte_eth_macaddr_get(1, &eth_tx_port_addr);
 	if (ret != 0)
 		return ret;
-	
-	arp_handle = rte_hash_find_existing(arp_param.name);
-	if (!arp_handle)
-		return -ENOENT;
-
-	key_handle = rte_hash_find_existing(key_param.name);
-	if (!key_handle)
-		return -ENOENT;
-
-	tcp_handle = rte_hash_find_existing(tcp_param.name);
-	if (!tcp_handle)
-		return -ENOENT;
 
 	lcore_id = rte_lcore_id();
 	printf("lcore %u: client --> server\n", lcore_id);
@@ -452,8 +443,8 @@ client2server(__rte_unused void *arg)
 						entry->valid, entry->hash, entry->key_len, entry->key);
 					DEBUG_PRINTF("      hash = %u,        key = %.*s\n",
 						key_hash, key_len, pos);
-					if (entry->valid && key_hash == entry->key.hash
-							&& !strncmp(pos, entry->key.data, key_len)) {
+					if (entry->valid && key_hash == key_table[entry->key_off].hash
+							&& !strncmp(pos, key_table[entry->key_off].data, key_len)) {
 						DEBUG_PRINTF("%d: GET HIT hook.\n", lcore_id);
 
 						if (unlikely(rte_pktmbuf_trim(m, payload_len)))
@@ -475,13 +466,7 @@ client2server(__rte_unused void *arg)
 						RTE_SWAP(eth->src_addr, eth->dst_addr);
 						RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
 						RTE_SWAP(tcph->src_port, tcph->dst_port);
-						// if (likely(ts->kind == 8)) {
-						// 	rte_be32_t tmp_val = ts->ecr;
-						// 	ts->ecr = ts->val;
-						// 	ts->val = rte_cpu_to_be_32(rte_be_to_cpu_32(tmp_val) + 1);
-						// }
 						ipv4h->total_length = rte_cpu_to_be_16(m->pkt_len - sizeof(struct rte_ether_hdr));
-
 						ipv4h->hdr_checksum = 0;
 
 						u_int32_t new_seq = tcph->recv_ack;
@@ -528,8 +513,8 @@ client2server(__rte_unused void *arg)
 					break;
 				case SET:
 					DEBUG_PRINTF("%d: SET hook.\n", lcore_id);
-					if (entry->valid && key_hash == entry->key.hash
-							&& !strncmp(pos, entry->key.data, key_len)) {
+					if (entry->valid && key_hash == key_table[entry->key_off].hash
+							&& !strncmp(pos, key_table[entry->key_off].data, key_len)) {
 						entry->valid = false;
 						stats0.set_hit++;
 					} else {
@@ -561,7 +546,7 @@ pass:
 				}
 			} 
 			else if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
-				   arp_process(eth, arp_handle, &eth_tx_port_addr);
+				arp_process(eth, &eth_tx_port_addr);
 			}
 
 			/* replace ethernet source address (client -> port1) */
@@ -594,9 +579,9 @@ pass:
 }
 
 static int
-server2client(void *arg)
+server2client(void *pool)
 {
-	struct rte_mempool *clone_pool = arg;
+	struct rte_mempool *clone_pool = pool;
 	int ret, ret_hit;
 	uint32_t lcore_id, sig, cache_index, payload_len; 
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_clone[BURST_SIZE];
@@ -605,7 +590,6 @@ server2client(void *arg)
 	struct rte_ether_addr eth_tx_port_addr;//, eth_client_addr;
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
-	struct rte_hash *arp_handle, *key_handle, *tcp_handle;
 	char *payload;
 	struct sequence_unique seq_uniq = {
 		.server_port = 6379
@@ -620,18 +604,6 @@ server2client(void *arg)
 	ret = rte_eth_macaddr_get(0, &eth_tx_port_addr);
 	if (ret != 0)
 		return ret;
-
-	arp_handle = rte_hash_find_existing(arp_param.name);
-	if (!arp_handle)
-		return -ENOENT;
-
-	key_handle = rte_hash_find_existing(key_param.name);
-	if (!key_handle)
-		return -ENOENT;
-
-	tcp_handle = rte_hash_find_existing(tcp_param.name);
-	if (!tcp_handle)
-		return -ENOENT;
 
 	lcore_id = rte_lcore_id();
 	printf("lcore %u: server --> client\n", lcore_id);
@@ -710,16 +682,16 @@ server2client(void *arg)
 				if (rte_pktmbuf_adj(m, (void*)payload - (void*)eth) == NULL)
 					printf("%d: failed to adjust packet.\n", lcore_id);
 
-				entry->key.len = ck->len;
-				//entry->data_len = payload_len;
-				entry->key.hash = ck->hash;
-				rte_memcpy(entry->key.data, ck->data, ck->len);
+				//entry->key.len = ck->len;
+				//entry->key.hash = ck->hash;
+				//rte_memcpy(entry->key.data, ck->data, ck->len);
+				rte_hash_free_key_with_position(key_handle, entry->key_off);
+				entry->key_off = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
 				rte_pktmbuf_free(entry->m_data);
-				//rte_memcpy(entry->data, payload, payload_len);
 				entry->m_data = m;
 				entry->valid = true;
 
-				ret = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
+				//ret = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
 				//rte_hash_free_key_with_position(key_handle, ret);
 
 				DEBUG_PRINTF("%d: cache_table updated %u\n", lcore_id, cache_index);
@@ -735,7 +707,7 @@ pass:
 
 			} 
 			else if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
-				arp_process(eth, arp_handle, &eth_tx_port_addr);
+				arp_process(eth, &eth_tx_port_addr);
 			}
 
 			/* replace ethernet source address (client -> port1) */
@@ -781,7 +753,6 @@ main(int argc, char *argv[])
 	struct rte_mempool *mbuf_pool, *clone_pool;
 	unsigned nb_ports;
 	uint16_t portid;
-	struct rte_hash *handle;
 	int lcoreid;
 
 	/* Initializion the Environment Abstraction Layer (EAL). 8< */
@@ -833,16 +804,16 @@ main(int argc, char *argv[])
 		printf("\nWARNING: Too many lcores enabled. Only 2 used.\n");
 
 	/* initializeing arp table */
-	handle = rte_hash_create(&arp_param);
-	if (!handle)
+	arp_handle = rte_hash_create(&arp_param);
+	if (!arp_handle)
 		rte_exit(EXIT_FAILURE, "Cannot init arp table.\n");
 
-	handle = rte_hash_create(&key_param);
-	if (!handle)
+	key_handle = rte_hash_create(&key_param);
+	if (!key_handle)
 		rte_exit(EXIT_FAILURE, "Cannot init key table.\n");
 
-	handle = rte_hash_create(&tcp_param);
-	if (!handle)
+	tcp_handle = rte_hash_create(&tcp_param);
+	if (!tcp_handle)
 		rte_exit(EXIT_FAILURE, "Cannot init conn table.\n");
 	
 	resp_cache = calloc(CACHE_ENTRY_SIZE, sizeof(struct cache_entry));
@@ -854,9 +825,6 @@ main(int argc, char *argv[])
 	/* >8 End of called on single lcore. */
 
 	rte_eal_mp_wait_lcore();
-
-	/* clean up arp table */
-	rte_hash_free(handle);
 
 	/* clean up the EAL */
 	rte_eal_cleanup();
