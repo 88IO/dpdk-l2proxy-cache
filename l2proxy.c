@@ -26,6 +26,8 @@
 #define PORT0 0
 #define PORT1 1
 
+#define PREFETCH_OFFSET 3
+
 #define CACHE_ENTRY_SIZE 8192
 #define RESP_MAX_KEY_LENGTH 256
 #define MAX_CACHE_DATA_LENGTH 1024
@@ -355,8 +357,6 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 
 	lcore_id = rte_lcore_id();
 
-	rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-
 	eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
 	if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
@@ -529,6 +529,7 @@ static int
 client2server(__rte_unused void *arg)
 {
 	int ret;
+	uint16_t j;
 	uint32_t lcore_id, nb_pass, nb_reply;
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
 	struct rte_ether_addr eth_tx_port_addr;
@@ -549,7 +550,17 @@ client2server(__rte_unused void *arg)
 
 		nb_reply = 0;
 
-		for (uint16_t j = 0; j < nb_rx; j++) {
+		for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
+			rte_prefetch0(rte_pktmbuf_mtod(
+							bufs[j], void *));
+		}
+		for (j = 0; j < (nb_rx - PREFETCH_OFFSET); j++) {
+			rte_prefetch0(rte_pktmbuf_mtod(
+							bufs[j + PREFETCH_OFFSET], void *));
+			nb_reply += client_packet_process(bufs[j], &eth_tx_port_addr, 
+								&bufs[j - nb_reply], &bufs_reply[nb_reply]);
+		}
+		for (; j < nb_rx; j++) {
 			nb_reply += client_packet_process(bufs[j], &eth_tx_port_addr, 
 								&bufs[j - nb_reply], &bufs_reply[nb_reply]);
 		}
@@ -591,7 +602,6 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 	lcore_id = rte_lcore_id();
 
 	m = *buf;
-	rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
 	eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
@@ -681,6 +691,7 @@ server2client(void *pool)
 {
 	struct rte_mempool *clone_pool = pool;
 	int ret, ret_hit;
+	uint16_t j;
 	uint32_t lcore_id, sig, cache_index, payload_len; 
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_clone[BURST_SIZE];
 	struct rte_mbuf *m;
@@ -709,7 +720,16 @@ server2client(void *pool)
 		if (unlikely(nb_rx == 0))
 			continue;
 
-		for (uint16_t j = 0; j < nb_rx; j++) {
+		for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
+			rte_prefetch0(rte_pktmbuf_mtod(
+							bufs[j], void *));
+		}
+		for (j = 0; j < (nb_rx - PREFETCH_OFFSET); j++) {
+			rte_prefetch0(rte_pktmbuf_mtod(
+							bufs[j + PREFETCH_OFFSET], void *));
+			server_packet_process(&bufs[j], &eth_tx_port_addr, clone_pool);
+		}
+		for (; j < nb_rx; j++) {
 			server_packet_process(&bufs[j], &eth_tx_port_addr, clone_pool);
 		}
 
