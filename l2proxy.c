@@ -372,7 +372,7 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 
 		pos = payload = (void *)tcph + (tcph->data_off >> 2);
 
-		payload_len = m->data_len + (void*)eth - (void*)payload;
+		payload_len = rte_be_to_cpu_16(ipv4h->total_length) + (void*)ipv4h - (void*)payload;
 
 		seq_uniq.tcp_key.client_addr = ipv4h->src_addr;
 		seq_uniq.tcp_key.server_addr = ipv4h->dst_addr;
@@ -421,8 +421,11 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 					&& !strncmp(pos, key_table[entry->key_off].data, key_len)) {
 				DEBUG_PRINTF("%d: GET HIT hook.\n", lcore_id);
 
-				if (unlikely(rte_pktmbuf_trim(m, payload_len)))
+				// if (unlikely(rte_pktmbuf_trim(m, payload_len)))
+				// 	goto resp;
+				if (unlikely(m->next))
 					goto resp;
+				m->pkt_len = m->data_len = (void*)payload - (void*)eth;
 				
 				rte_pktmbuf_refcnt_update(entry->m_data, 1);
 				m->next = entry->m_data;
@@ -452,6 +455,8 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 					(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(rte_be_to_cpu_16(ipv4h->total_length) - (ipv4h->ihl << 2))
 				);
 				tcph->cksum = csum16_add(pseudo_cksum & 0xFFFF, pseudo_cksum >> 16);
+
+				if (m->pkt_len < 60)  m->pkt_len = 60;
 
 				m->l2_len = sizeof(struct rte_ether_hdr);
 				m->l3_len = sizeof(struct rte_ipv4_hdr);
@@ -618,7 +623,7 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 
 		payload = (char *)((void *)tcph + (tcph->data_off >> 2));
 
-		payload_len = m->data_len + (void*)eth - (void*)payload;
+		payload_len = rte_be_to_cpu_16(ipv4h->total_length) + (void*)ipv4h - (void*)payload;
 
 		seq_uniq.tcp_key.client_addr = ipv4h->dst_addr;
 		seq_uniq.tcp_key.server_addr = ipv4h->src_addr;
@@ -661,6 +666,7 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 
 		if (rte_pktmbuf_adj(m, (void*)payload - (void*)eth) == NULL)
 			printf("%d: failed to adjust packet.\n", lcore_id);
+		m->pkt_len = payload_len;
 
 		rte_hash_free_key_with_position(key_handle, entry->key_off);
 		entry->key_off = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
