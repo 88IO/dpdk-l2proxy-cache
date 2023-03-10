@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <rte_hash.h>
 #include <rte_jhash.h>
+#include <rte_atomic.h>
 
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
@@ -32,7 +33,7 @@
 #define RESP_MAX_KEY_LENGTH 256
 #define MAX_CACHE_DATA_LENGTH 1024
 
-#define KEY_ENTRY_SIZE 512
+#define KEY_ENTRY_SIZE (512 + CACHE_ENTRY_SIZE)
 #define ARP_ENTRY_SIZE 128
 #define CONN_ENTRY_SIZE 1024
 
@@ -65,13 +66,13 @@ struct sequence_unique {
 struct cache_key {
 	uint32_t hash;
 	uint32_t len;
+	uint32_t pos;
 	char data[RESP_MAX_KEY_LENGTH];
 };
 
 struct cache_entry {
+	struct cache_key *key;
 	struct rte_mbuf *m_data;
-	uint32_t key_off;
-	bool valid;
 };
 
 struct tcp_info {
@@ -349,7 +350,7 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 	struct rte_tcp_hdr *tcph;
 	char *pos, *payload;
 	enum resp_method resp_m;
-	struct cache_entry *entry;
+	struct cache_entry *entry, old_entry;
 	struct sequence_unique seq_uniq = {
 		.server_port = 6379
 	};
@@ -417,9 +418,11 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 			DEBUG_PRINTF("      hash = %u,        key = %.*s\n",
 				key_hash, key_len, pos);
 
-			if (entry->valid && key_hash == key_table[entry->key_off].hash
-					&& !strncmp(pos, key_table[entry->key_off].data, key_len)) {
+			if (entry->key && key_hash == entry->key->hash
+					&& !strncmp(pos, entry->key->data, key_len)) {
 				DEBUG_PRINTF("%d: GET HIT hook.\n", lcore_id);
+
+				//printf("0: [%u] refcnt = %d\n", cache_index, entry->m_data->refcnt);
 
 				// if (unlikely(rte_pktmbuf_trim(m, payload_len)))
 				// 	goto resp;
@@ -474,6 +477,7 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 					struct cache_key *ck = &key_table[ret];
 					ck->hash = key_hash;
 					ck->len = key_len;
+					ck->pos = ret;
 					rte_memcpy(ck->data, pos, key_len);
 
 					DEBUG_PRINTF("%d: add key_info:\n", lcore_id);
@@ -491,9 +495,16 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 		case SET:
 			DEBUG_PRINTF("%d: SET hook.\n", lcore_id);
 
-			if (entry->valid && key_hash == key_table[entry->key_off].hash
-					&& !strncmp(pos, key_table[entry->key_off].data, key_len)) {
-				entry->valid = false;
+			if (entry->key && key_hash == entry->key->hash
+					&& !strncmp(pos, entry->key->data, key_len)) {
+				old_entry.key = (struct cache_key*)
+					rte_atomic64_exchange((uint64_t*)&entry->key, (uint64_t)NULL);
+				old_entry.m_data = (struct rte_mbuf*)
+					rte_atomic64_exchange((uint64_t*)&entry->m_data, (uint64_t)NULL);
+				if (old_entry.key)
+					rte_hash_free_key_with_position(key_handle, old_entry.key->pos);
+				if (old_entry.m_data)
+					rte_pktmbuf_free(old_entry.m_data);
 				stats0.set_hit++;
 			} else {
 				stats0.set_miss++;
@@ -601,7 +612,7 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 	struct sequence_unique seq_uniq = {
 		.server_port = 6379
 	};
-	struct cache_entry *entry;
+	struct cache_entry *entry, old_entry;
 	struct tcp_info *hit_info;
 
 	lcore_id = rte_lcore_id();
@@ -668,11 +679,16 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 			printf("%d: failed to adjust packet.\n", lcore_id);
 		m->pkt_len = payload_len;
 
-		rte_hash_free_key_with_position(key_handle, entry->key_off);
-		entry->key_off = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
-		rte_pktmbuf_free(entry->m_data);
-		entry->m_data = m;
-		entry->valid = true;
+		rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
+
+		old_entry.key = (struct cache_key*)
+			rte_atomic64_exchange((uint64_t*)&entry->key, (uint64_t)ck);
+		old_entry.m_data = (struct rte_mbuf*)
+			rte_atomic64_exchange((uint64_t*)&entry->m_data, (uint64_t)m);
+		if (old_entry.key)
+			rte_hash_free_key_with_position(key_handle, old_entry.key->pos);
+		if (old_entry.m_data)
+			rte_pktmbuf_free(old_entry.m_data);
 
 		DEBUG_PRINTF("%d: cache_table updated %u\n", lcore_id, cache_index);
 		DEBUG_PRINTF("%d: data = '%.*s'\n", lcore_id, entry->m_data->data_len, (char*)entry->m_data->buf_addr);
