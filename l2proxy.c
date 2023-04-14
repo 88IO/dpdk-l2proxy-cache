@@ -208,6 +208,14 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 			.offloads =
 				RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
 				RTE_ETH_TX_OFFLOAD_TCP_CKSUM
+		},
+		.rxmode = {
+			.mq_mode = RTE_ETH_MQ_RX_RSS_FLAG
+		},
+		.rx_adv_conf = {
+			.rss_conf = {
+				.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP
+			}
 		}
 	};
 	struct rte_eth_txconf txconf;
@@ -223,9 +231,6 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 				port, strerror(-retval));
 		return retval;
 	}
-	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS)
-		printf("RTE_ETH_TX_OFFLOAD_MULTI_SEGS = %d\n", 
-			!!(port_conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_MULTI_SEGS));
 
 	if (!(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)
 	    || !(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) {
@@ -233,6 +238,7 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	}
 
 	port_conf.txmode.offloads &= dev_info.tx_offload_capa;
+	port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
 
 	/* Configure the Ethernet device. */
 	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
@@ -774,12 +780,22 @@ static void
 signal_handler(int signum)
 {
 	if (signum == SIGINT || signum == SIGTERM) {
+		struct rte_eth_stats eth_stats;
+
+		rte_eth_stats_get(0, &eth_stats);
 		printf("stats: client --> server\n  pass = %u (set_miss = %u, set_hit = %u, get_miss = %u), reply = %u, error = %u\n",
 				stats0.pass, stats0.set_miss, 
 				stats0.set_hit, stats0.get_miss,
 				stats0.reply, stats0.error);
+		printf(" ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
+		        eth_stats.ipackets, eth_stats.ierrors, eth_stats.imissed, eth_stats.opackets, eth_stats.oerrors);
+
+		rte_eth_stats_get(1, &eth_stats);
 		printf("stats: client <-- server\n  pass = %u, reply = %u, error = %u\n",
 				stats1.pass, stats1.reply, stats1.error);
+		printf(" ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
+		        eth_stats.ipackets, eth_stats.ierrors, eth_stats.imissed, eth_stats.opackets, eth_stats.oerrors);
+
 		force_quit = true;
 	}
 }
