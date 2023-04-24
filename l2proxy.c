@@ -29,10 +29,14 @@
 
 #define PREFETCH_OFFSET 3
 
+#define CASSANDRA_PORT 9042
+
 #define CACHE_ENTRY_SIZE 8192
 #define RESP_MAX_KEY_LENGTH 256
 #define CQL_MAX_KEY_LENGTH 256
 #define MAX_CACHE_DATA_LENGTH 1024
+#define MAX_PREPARED_ID_LENGTH 64
+#define PREPARED_ENTRY_SIZE 64
 
 #define KEY_ENTRY_SIZE (512 + CACHE_ENTRY_SIZE)
 #define ARP_ENTRY_SIZE 128
@@ -52,6 +56,63 @@
 # define DEBUG_PRINTF(fmt, ...)
 #endif
 
+#define CQLV4_FLAGS_COMPRESSION 0x01
+#define CQLV4_FLAGS_TRACING 0x02
+#define CQLV4_FLAGS_CUSTOM_PAYLOAD 0x04
+#define CQLV4_FLAGS_WARNING 0x08
+
+enum cql_query_type {
+	CQL_QUERY_NULL,
+	CQL_QUERY_SELECT,
+	CQL_QUERY_UPDATE
+};
+
+enum cql_result_kind {
+	CQL_RESULT_KIND_VOID          = 0x0001,
+	CQL_RESULT_KIND_ROWS          = 0x0002,
+	CQL_RESULT_KIND_SET_KEYSPACE  = 0x0003,
+	CQL_RESULT_KIND_PREPARED      = 0x0004,
+	CQL_RESULT_KIND_SCHEMA_CHANGE = 0x0005
+};
+
+enum cql_opecode {
+	CQL_OP_ERROR          = 0x00,
+	CQL_OP_STARTUP        = 0x01,
+	CQL_OP_READY          = 0x02,
+	CQL_OP_AUTHENTICATE   = 0x03,
+	CQL_OP_OPTIONS        = 0x05,
+	CQL_OP_SUPPORTED      = 0x06,
+	CQL_OP_QUERY          = 0x07,
+	CQL_OP_RESULT         = 0x08,
+	CQL_OP_PREPARE        = 0x09,
+	CQL_OP_EXECUTE        = 0x0A,
+	CQL_OP_REGISTER       = 0x0B,
+	CQL_OP_EVENT          = 0x0C,
+	CQL_OP_BATCH          = 0x0D,
+	CQL_OP_AUTH_CHALLENGE = 0x0E,
+	CQL_OP_AUTH_RESPONSE  = 0x0F,
+	CQL_OP_AUTH_SUCCESS   = 0x10,
+};
+
+static char * const OPECODE[] = {
+	[CQL_OP_ERROR]          = "ERROR",
+	[CQL_OP_STARTUP]        = "STARTUP",
+	[CQL_OP_READY]          = "READY",
+	[CQL_OP_AUTHENTICATE]   = "AUTHENTICATE",
+	[CQL_OP_OPTIONS]        = "OPTIONS",
+	[CQL_OP_SUPPORTED]      = "SUPPORTED",
+	[CQL_OP_QUERY]          = "QUERY",
+	[CQL_OP_RESULT]         = "RESULT",
+	[CQL_OP_PREPARE]        = "RPEPARE",
+	[CQL_OP_EXECUTE]        = "EXECUTE",
+	[CQL_OP_REGISTER]       = "REGISTER",
+	[CQL_OP_EVENT]          = "EVENT",
+	[CQL_OP_BATCH]          = "BATCH",
+	[CQL_OP_AUTH_CHALLENGE] = "AUTH_CHALLENGE",
+	[CQL_OP_AUTH_RESPONSE]  = "AUTH_RESPONSE",
+	[CQL_OP_AUTH_SUCCESS]   = "AUTH_SUCCESS",
+};
+
 struct tcp_key {
 	rte_be32_t client_addr;
 	rte_be32_t server_addr;
@@ -68,12 +129,19 @@ struct cache_key {
 	uint32_t hash;
 	uint32_t len;
 	uint32_t pos;
+	enum cql_query_type query_type;
 	char data[CQL_MAX_KEY_LENGTH];
 };
 
 struct cache_entry {
 	struct cache_key *key;
 	struct rte_mbuf *m_data;
+};
+
+struct prepared_entry {
+	struct cache_key *key;
+	uint32_t id_len;
+	char id[MAX_PREPARED_ID_LENGTH];
 };
 
 struct tcp_info {
@@ -100,48 +168,6 @@ struct cqlv4_hdr {
 	uint8_t opecode;
 	rte_be32_t length;
 } __attribute__((packed));
-
-#define CQLV4_FLAGS_COMPRESSION 0x01
-#define CQLV4_FLAGS_TRACING 0x02
-#define CQLV4_FLAGS_CUSTOM_PAYLOAD 0x04
-#define CQLV4_FLAGS_WARNING 0x08
-
-enum cql_opecode {
-	CQL_ERROR = 0x00,
-	CQL_STARTUP = 0x01,
-	CQL_READY = 0x02,
-	CQL_AUTHENTICATE = 0x03,
-	CQL_OPTIONS = 0x05,
-	CQL_SUPPORTED = 0x06,
-	CQL_QUERY = 0x07,
-	CQL_RESULT = 0x08,
-	CQL_PREPARE = 0x09,
-	CQL_EXECUTE = 0x0A,
-	CQL_REGISTER = 0x0B,
-	CQL_EVENT = 0x0C,
-	CQL_BATCH = 0x0D,
-	CQL_AUTH_CHALLENGE = 0x0E,
-	CQL_AUTH_RESPONSE = 0x0F,
-	CQL_AUTH_SUCCESS = 0x10,
-};
-static char * const OPECODE[] = {
-	[CQL_ERROR] = "ERROR",
-	[CQL_STARTUP] = "STARTUP",
-	[CQL_READY] = "READY",
-	[CQL_AUTHENTICATE] = "AUTHENTICATE",
-	[CQL_OPTIONS] = "OPTIONS",
-	[CQL_SUPPORTED] = "SUPPORTED",
-	[CQL_QUERY] = "QUERY",
-	[CQL_RESULT] = "RESULT",
-	[CQL_PREPARE] = "RPEPARE",
-	[CQL_EXECUTE] = "EXECUTE",
-	[CQL_REGISTER] = "REGISTER",
-	[CQL_EVENT] = "EVENT",
-	[CQL_BATCH] = "BATCH",
-	[CQL_AUTH_CHALLENGE] = "AUTH_CHALLENGE",
-	[CQL_AUTH_RESPONSE] = "AUTH_RESPONSE",
-	[CQL_AUTH_SUCCESS] = "AUTH_SUCCESS",
-};
 
 int skip_whitespace(char *pos) {
 	int n = 0;
@@ -179,29 +205,29 @@ int get_cql_token(char *pos) {
 	return n;
 }
 
-struct cql_search_conf {
+struct cql_query_conf {
 	char *keyspace;
 	char *table;
 	char *keyname;
 	char *fieldname;
 	char *keydata;
 	char *fielddata;
-	uint16_t keyspace_length;
-	uint16_t table_length;
-	uint16_t keyname_length;
-	uint16_t fieldname_length;
-	uint16_t keydata_length;
-	uint16_t fielddata_length;
+	uint32_t keyspace_length;
+	uint32_t table_length;
+	uint32_t keyname_length;
+	uint32_t fieldname_length;
+	uint32_t keydata_length;
+	uint32_t fielddata_length;
+	enum cql_query_type type;
 };
 
-int cql_update_parse(char *pos, struct cql_search_conf *conf) {
+int cql_update_parse(char *pos, struct cql_query_conf *conf) {
 	int n;
 	char *c;
 
 	n = get_cql_token(pos);
 	if (strncmp(pos, "UPDATE", 6))
 		return -1;
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
@@ -218,7 +244,6 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 			break;
 		}
 	}
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
@@ -227,7 +252,6 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 	if (strncmp(pos, "SET", 3)) {
 		return -1;
 	}
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
@@ -235,13 +259,11 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 	n = get_cql_token(pos);
 	conf->fieldname = pos;
 	conf->fieldname_length = n;
-	printf("%.*s\n", n, pos);
 	
 	pos += n;
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	if (n != 1 || *pos != '=') {
 		return -1;
 	}
@@ -250,7 +272,6 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	if (n != 1 && n != '?') {
 		conf->fielddata = pos;
 		conf->fielddata_length = n;
@@ -263,13 +284,11 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 	if (strncmp(pos, "WHERE", 5)) {
 		return -1;
 	}
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	conf->keyname = pos;
 	conf->keyname_length = n;
 
@@ -277,7 +296,6 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	if (n != 1 || *pos != '=') {
 		return -1;
 	}
@@ -286,7 +304,6 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	if (n != 1 && n != '?') {
 		conf->keydata = pos;
 		conf->keydata_length = n;
@@ -304,16 +321,16 @@ int cql_update_parse(char *pos, struct cql_search_conf *conf) {
 		return -1;
 	}
 
+	conf->type = CQL_QUERY_UPDATE;
 	return 0;
 }
 
-int cql_select_parse(char *pos, struct cql_search_conf *conf) {
+int cql_select_parse(char *pos, struct cql_query_conf *conf) {
 	int n;
 	char *c;
 	n = get_cql_token(pos);
 	if (strncmp(pos, "SELECT", 6))
 		return -1;
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
@@ -321,7 +338,6 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 	n = get_cql_token(pos);
 	conf->fieldname = pos;
 	conf->fieldname_length = n;
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
@@ -330,7 +346,6 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 	if (strncmp(pos, "FROM", 4)) {
 		return -1;
 	}
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
@@ -338,7 +353,6 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 	n = get_cql_token(pos);
 	conf->table = pos;
 	conf->table_length = n;
-	printf("%.*s\n", n, pos);
 	for (int i = 0; i < n; i++) {
 		if (*(pos + i) == '.') {
 			conf->keyspace = pos;
@@ -353,7 +367,6 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	if (strncmp(pos, "WHERE", 5)) {
 		return - 1;
 	}
@@ -364,13 +377,11 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 	n = get_cql_token(pos);
 	conf->keyname = pos;
 	conf->keyname_length = n;
-	printf("%.*s\n", n, pos);
 
 	pos += n;
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	if (n != 1 || *pos != '=') {
 		return -1;
 	}
@@ -379,7 +390,6 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 	pos += skip_whitespace(pos);
 
 	n = get_cql_token(pos);
-	printf("%.*s\n", n, pos);
 	if (n != 1 && n != '?') {
 		conf->keydata = pos;
 		conf->keydata_length = n;
@@ -394,6 +404,7 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 
 	n = get_cql_token(pos);
 	if (n == 1 && *pos == ';') {
+		conf->type = CQL_QUERY_SELECT;
 		return 0;
 	}
 	if (strncmp(pos, "LIMIT", 5)) {
@@ -413,11 +424,12 @@ int cql_select_parse(char *pos, struct cql_search_conf *conf) {
 		return -1;
 	}
 	
+	conf->type = CQL_QUERY_SELECT;
 	return 0;
 }
 
 static inline uint32_t
-fnv_hash(const char *key, uint32_t length, uint32_t initval) 
+fnv1a_hash(const char *key, uint32_t length, uint32_t initval) 
 {
     uint32_t off;
     uint32_t hash = initval;
@@ -483,7 +495,8 @@ static struct _stats stats0, stats1, stats0_prev, stats1_prev;
 
 struct rte_hash *arp_handle, *key_handle, *tcp_handle;
 
-static struct cache_entry resp_cache[CACHE_ENTRY_SIZE] __rte_cache_aligned;
+static struct cache_entry cache_table[CACHE_ENTRY_SIZE] __rte_cache_aligned;
+static struct prepared_entry prepared_table[PREPARED_ENTRY_SIZE] __rte_cache_aligned;
 
 static struct rte_ether_addr arp_table[ARP_ENTRY_SIZE] __rte_cache_aligned;
 static struct cache_key key_table[CACHE_ENTRY_SIZE + CONN_ENTRY_SIZE] __rte_cache_aligned;
@@ -640,16 +653,32 @@ arp_process(struct rte_ether_hdr *eth, struct rte_ether_addr *src_addr) {
 	rte_ether_addr_copy(src_addr, &arp->arp_data.arp_sha);
 }
 
+int update_cache() {
+
+	return 0;
+}
+
+int invalidate_cache() {
+	return 0;
+}
+
 static inline int
 client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_addr,
 					  struct rte_mbuf **buf_pass, struct rte_mbuf **buf_reply) {
-	int ret;
-	uint32_t lcore_id;
+	int ret, ret_hit;
+	uint32_t lcore_id, sig, cql_body_len;
 	struct rte_ether_hdr *eth;
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
-	char *pos, *payload;
 	struct cqlv4_hdr *cqlv4h;
+	struct sequence_unique seq_uniq = {
+		.server_port = CASSANDRA_PORT
+	};
+	struct tcp_info *hit_info;
+	struct cql_query_conf query_conf;
+	rte_be32_t *query_length_ptr;
+	void *query_ptr, *cql_body;
+	enum cql_query_type query_type;
 
 	lcore_id = rte_lcore_id();
 
@@ -663,46 +692,227 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 
 		tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
 
-		if (tcph->dst_port != rte_cpu_to_be_16(9042))
-			goto pass;	
-
-		if (rte_be_to_cpu_16(ipv4h->total_length) <= 9 + (ipv4h->ihl << 2) + (tcph->data_off >> 2))
+		if (tcph->dst_port != rte_cpu_to_be_16(CASSANDRA_PORT))
 			goto pass;
 
+		seq_uniq.tcp_key.client_addr = ipv4h->src_addr;
+		seq_uniq.tcp_key.server_addr = ipv4h->dst_addr;
+		seq_uniq.tcp_key.client_port = tcph->src_port;	
+	
+		sig = rte_hash_hash(tcp_handle, &seq_uniq);
+		if (tcph->tcp_flags & (RTE_TCP_FIN_FLAG | RTE_TCP_SYN_FLAG)) {
+			ret = rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
+		}
+		if ((ret_hit = rte_hash_lookup_with_hash(tcp_handle, &seq_uniq, sig)) >= 0) {
+			hit_info = &tcp_table[ret_hit];
+		};
+
+		if (rte_be_to_cpu_16(ipv4h->total_length) <= 9 + (ipv4h->ihl << 2) + (tcph->data_off >> 2))
+			goto cql;
+
 		cqlv4h = (struct cqlv4_hdr*)((void*)tcph + (tcph->data_off >> 2));
-		printf("version = 0x%02x, flags = 0x%02x, stream_id = %u, opecode = 0x%02x(%s), length = %u\n",
+
+		DEBUG_PRINTF("version = 0x%02x, flags = 0x%02x, stream_id = %u, opecode = 0x%02x(%s), length = %u\n",
 			cqlv4h->version, cqlv4h->flags, 
 			rte_be_to_cpu_16(cqlv4h->stream), cqlv4h->opecode, OPECODE[cqlv4h->opecode], 
 			rte_be_to_cpu_32(cqlv4h->length));
+
+		cql_body = cqlv4h + 1;
+		cql_body_len = rte_be_to_cpu_16(ipv4h->total_length) + (void*)ipv4h - cql_body;
 		
-		if (cqlv4h->opecode != CQL_QUERY) 
-			goto pass;
+		if (cqlv4h->version != 0x04 || !(cqlv4h->opecode & (CQL_OP_QUERY | CQL_OP_PREPARE))) 
+			goto cql;
 
-		rte_be32_t *query_length_ptr = (rte_be32_t*)(cqlv4h + 1);
+		query_length_ptr = (rte_be32_t*)cql_body;
 		uint32_t query_length = rte_be_to_cpu_32(*query_length_ptr);
-		printf("query_length = %u\n", query_length);
-		char *query_ptr = (char*)(query_length_ptr + 1); 
-		printf("query: %.*s\n", query_length, query_ptr);
 
-		struct cql_search_conf conf;
-		memset(&conf, 0, sizeof(conf)); 
+		query_ptr = (char*)(query_length_ptr + 1); 
+		query_conf.type = CQL_QUERY_NULL;
 
-		if (cql_select_parse(query_ptr, &conf) && cql_update_parse(query_ptr, &conf)) {
-			goto pass;
+
+		if (cqlv4h->opecode == CQL_OP_EXECUTE) {
+			uint16_t id_len = rte_be_to_cpu_16(*(rte_be16_t*)cql_body);
+			char *id_ptr = cql_body + sizeof(rte_be16_t); 
+			uint32_t prepared_hash = fnv1a_hash(id_ptr, id_len, FNV_OFFSET_BASIS_32);
+			uint32_t prepared_index = prepared_hash % PREPARED_ENTRY_SIZE;
+			struct prepared_entry *p_entry = &prepared_table[prepared_index];
+
+			// skip id, consistency(2B) + flags(1B)
+			rte_be16_t *value_count_ptr = (rte_be16_t*)(id_ptr + id_len + 3);
+			uint16_t value_count = rte_be_to_cpu_16(*value_count_ptr);
+
+			if (!p_entry->key || !p_entry->id)
+				goto cql;
+
+			if (id_len != p_entry->id_len || strncmp(id_ptr, p_entry->id, id_len)) 
+				goto cql;
+
+			query_conf.type = p_entry->key->query_type;
+
+			if (p_entry->key->query_type == CQL_QUERY_SELECT && value_count == 1) {
+				DEBUG_PRINTF("%d: EXECUTE SELECT\n", lcore_id);
+				rte_be32_t *value_len_ptr = (rte_be32_t*)(value_count_ptr + 1);
+				query_conf.keydata_length = rte_be_to_cpu_32(*value_len_ptr);
+				query_conf.keydata = (char*)(value_len_ptr + 1);
+			} else if (p_entry->key->query_type == CQL_QUERY_UPDATE && value_count == 2) {
+				DEBUG_PRINTF("%d: EXECUTE UPDATE\n", lcore_id);
+				rte_be32_t *value_len_ptr = (rte_be32_t*)(value_count_ptr + 1);
+				uint32_t fielddata_length = rte_be_to_cpu_32(*value_len_ptr);
+				char *fielddata = (char*)(value_len_ptr + 1);
+
+				value_len_ptr = (rte_be32_t*)(fielddata + fielddata_length);
+				query_conf.keydata_length = rte_be_to_cpu_32(*value_len_ptr);
+				query_conf.keydata = (char*)(value_len_ptr + 1);
+			}
+		} else if (cqlv4h->opecode == CQL_OP_QUERY) {
+			if (cql_select_parse(query_ptr, &query_conf) && cql_update_parse(query_ptr, &query_conf)) 
+				goto cql;
+			DEBUG_PRINTF("%d: EXECUTE HOOK.\n", lcore_id);
+			DEBUG_PRINTF("%d: query: %.*s\n", lcore_id, query_length, (char*)query_ptr);
 		}
-		if (conf.keyspace_length)
-			printf("keyspace    = %.*s\n", conf.keyspace_length, conf.keyspace);
-		if (conf.table_length)
-			printf("table       = %.*s\n", conf.table_length, conf.table);
-		if (conf.keyname)
-			printf("key name    = %.*s\n", conf.keyname_length, conf.keyname);
-		if (conf.keydata_length)
-			printf("key data    = %.*s\n", conf.keydata_length, conf.keydata);
-		if (conf.fieldname_length)
-			printf("field name  = %.*s\n", conf.fieldname_length, conf.fieldname);
-		if (conf.fielddata_length)
-			printf("field data  = %.*s\n", conf.fielddata_length, conf.fielddata);
 
+		if (query_conf.type == CQL_QUERY_SELECT) {
+			uint32_t key_hash = fnv1a_hash(query_conf.keydata, query_conf.keydata_length, FNV_OFFSET_BASIS_32);
+			uint32_t cache_index = key_hash % CACHE_ENTRY_SIZE;
+			struct cache_entry *entry = &cache_table[cache_index];
+
+			if (entry->key && key_hash == entry->key->hash
+				           && !strncmp(query_conf.keydata, entry->key->data, query_conf.keydata_length)) {
+				DEBUG_PRINTF("%d: SELECT HIT HOOK.\n", lcore_id);
+
+				if (unlikely(m->next))
+					goto cql;
+				m->pkt_len = m->data_len = (void*)(cqlv4h + 1) - (void*)eth;
+				
+				rte_pktmbuf_refcnt_update(entry->m_data, 1);
+				m->next = entry->m_data;
+				m->pkt_len += entry->m_data->pkt_len;
+				m->nb_segs = entry->m_data->nb_segs + 1;
+				DEBUG_PRINTF("%d: m_data->pkt_len = %u\n", lcore_id, entry->m_data->pkt_len);
+
+				if (ret_hit < 0 && (ret_hit = rte_hash_add_key(tcp_handle, &seq_uniq)) >= 0) {
+					hit_info = &tcp_table[ret_hit];
+					hit_info->recv_bytes = 0;
+					hit_info->send_bytes = 0;
+				}
+				hit_info->recv_bytes += sizeof(struct cqlv4_hdr) + cql_body_len;
+				hit_info->send_bytes += sizeof(struct cqlv4_hdr) + entry->m_data->data_len;
+;
+				RTE_SWAP(eth->src_addr, eth->dst_addr);
+				RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
+				RTE_SWAP(tcph->src_port, tcph->dst_port);
+				ipv4h->total_length = rte_cpu_to_be_16(m->pkt_len - sizeof(struct rte_ether_hdr));
+				ipv4h->hdr_checksum = 0;
+
+				u_int32_t new_seq = tcph->recv_ack;
+				tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) + sizeof(struct cqlv4_hdr) + cql_body_len);
+				tcph->sent_seq = new_seq;
+
+				uint32_t pseudo_cksum = csum32_add(
+					csum32_add(ipv4h->src_addr, ipv4h->dst_addr),
+					(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(rte_be_to_cpu_16(ipv4h->total_length) - (ipv4h->ihl << 2))
+				);
+				tcph->cksum = csum16_add(pseudo_cksum & 0xFFFF, pseudo_cksum >> 16);
+
+				if (m->pkt_len < 60)  m->pkt_len = 60;
+
+				cqlv4h->version = 0x84;
+				cqlv4h->opecode = CQL_OP_RESULT;
+				cqlv4h->length = rte_cpu_to_be_32(entry->m_data->pkt_len);
+
+				m->l2_len = sizeof(struct rte_ether_hdr);
+				m->l3_len = sizeof(struct rte_ipv4_hdr);
+				m->ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM);
+
+				stats0.get_hit++;
+
+				*buf_reply = m;
+				return 1;
+			} else {
+				DEBUG_PRINTF("%d: SELECT MISS HOOK.\n", lcore_id);
+
+				seq_uniq.seq = tcph->recv_ack;
+
+				sig = rte_hash_hash(key_handle, &seq_uniq);
+				if ((ret = rte_hash_add_key_with_hash(key_handle, &seq_uniq, sig)) >= 0) {
+					struct cache_key *ck = &key_table[ret];
+					ck->hash = key_hash;
+					ck->len = query_conf.keydata_length;
+					ck->pos = ret;
+					ck->query_type = CQL_QUERY_SELECT;
+					rte_memcpy(ck->data, query_conf.keydata, query_conf.keydata_length);
+
+					DEBUG_PRINTF("%d: add key_info:\n", lcore_id);
+					DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.tcp_key.client_addr);
+					DEBUG_PRINTF("      server_addr = %u\n", seq_uniq.tcp_key.server_addr);
+					DEBUG_PRINTF("      seq = %u\n", seq_uniq.seq);
+					DEBUG_PRINTF("      client_port = %u\n", seq_uniq.tcp_key.client_port);
+				} else {
+					printf("ERR: failed to add key.\n");
+				}
+				stats0.get_miss++;
+			}
+		} else if (query_conf.type == CQL_QUERY_UPDATE) { 
+			DEBUG_PRINTF("%d: UPDATE HOOK.\n", lcore_id);
+			uint32_t key_hash = fnv1a_hash(query_conf.keydata, query_conf.keydata_length, FNV_OFFSET_BASIS_32);
+			uint32_t cache_index = key_hash % CACHE_ENTRY_SIZE;
+			struct cache_entry *entry = &cache_table[cache_index];
+			struct cache_entry old_entry;
+
+			if (entry->key && key_hash == entry->key->hash
+				           && !strncmp(query_conf.keydata, entry->key->data, query_conf.keydata_length)) {
+				old_entry.key = (struct cache_key*)
+					rte_atomic64_exchange((uint64_t*)&entry->key, (uint64_t)NULL);
+				old_entry.m_data = (struct rte_mbuf*)
+					rte_atomic64_exchange((uint64_t*)&entry->m_data, (uint64_t)NULL);
+				if (old_entry.key)
+					rte_hash_free_key_with_position(key_handle, old_entry.key->pos);
+				if (old_entry.m_data)
+					rte_pktmbuf_free(old_entry.m_data);
+
+				stats0.set_hit++;
+			} else {
+				stats0.set_miss++;
+			} 
+		} else if (cqlv4h->opecode == CQL_OP_PREPARE) {
+			if (cql_select_parse(query_ptr, &query_conf) && cql_update_parse(query_ptr, &query_conf)) 
+				goto cql;
+
+			DEBUG_PRINTF("%d: query: %.*s\n", lcore_id, query_length, (char*)query_ptr);
+			DEBUG_PRINTF("%d: PREPARE HOOK.\n", lcore_id);
+
+			uint32_t key_hash = fnv1a_hash(query_conf.keydata, query_conf.keydata_length, FNV_OFFSET_BASIS_32);
+
+			seq_uniq.seq = tcph->recv_ack;
+
+			sig = rte_hash_hash(key_handle, &seq_uniq);
+			if ((ret = rte_hash_add_key_with_hash(key_handle, &seq_uniq, sig)) >= 0) {
+				struct cache_key *ck = &key_table[ret];
+				ck->hash = key_hash;
+				ck->len = query_conf.keydata_length;
+				ck->pos = ret;
+				ck->query_type = query_conf.type;
+				rte_memcpy(ck->data, query_conf.keydata, query_conf.keydata_length);
+
+				DEBUG_PRINTF("%d: add key_info:\n", lcore_id);
+				DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.tcp_key.client_addr);
+				DEBUG_PRINTF("      server_addr = %u\n", seq_uniq.tcp_key.server_addr);
+				DEBUG_PRINTF("      seq = %u\n", seq_uniq.seq);
+				DEBUG_PRINTF("      client_port = %u\n", seq_uniq.tcp_key.client_port);
+			} else {
+				printf("ERR: failed to add key.\n");
+			}
+		} 
+
+cql:
+		if (ret_hit >= 0) {
+			uint32_t csum32 = ~tcph->cksum & 0xFFFF;
+			csum32 = csum32_add(csum32_add(csum32, ~tcph->sent_seq), ~tcph->recv_ack);
+			tcph->sent_seq = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) - hit_info->recv_bytes);
+			tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->recv_ack) - hit_info->send_bytes);
+			csum32 = csum32_add(csum32_add(csum32, tcph->sent_seq), tcph->recv_ack);
+			tcph->cksum = ~csum16_add(csum32 & 0xFFFF, csum32 >> 16);
+		}
 
 pass:
 		if (!rte_is_broadcast_ether_addr(&eth->dst_addr)
@@ -784,10 +994,16 @@ static inline void
 server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_addr, struct rte_mempool *clone_pool) {
 	int ret;
 	struct rte_mbuf *m;
-	uint32_t lcore_id; 
+	uint32_t lcore_id, sig, cql_body_len; 
 	struct rte_ether_hdr *eth;
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
+	struct cqlv4_hdr *cqlv4h;
+	struct sequence_unique seq_uniq = {
+		.server_port = CASSANDRA_PORT
+	};
+	struct tcp_info *hit_info;
+	void *cql_body;
 
 	lcore_id = rte_lcore_id();
 
@@ -803,8 +1019,97 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 		
 		tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
 
-		if (tcph->src_port != rte_cpu_to_be_16(9042))
+		if (tcph->src_port != rte_cpu_to_be_16(CASSANDRA_PORT))
 			goto pass;				
+
+		seq_uniq.tcp_key.client_addr = ipv4h->dst_addr;
+		seq_uniq.tcp_key.server_addr = ipv4h->src_addr;
+		seq_uniq.tcp_key.client_port = tcph->dst_port;
+		
+		if ((ret = rte_hash_lookup(tcp_handle, &seq_uniq)) >= 0) {
+			hit_info = &tcp_table[ret];
+			uint32_t csum32 = ~tcph->cksum & 0xFFFF;
+			csum32 = csum32_add(csum32_add(csum32, ~tcph->sent_seq), ~tcph->recv_ack);
+			tcph->sent_seq = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->sent_seq) + hit_info->send_bytes);
+			tcph->recv_ack = rte_cpu_to_be_32(rte_be_to_cpu_32(tcph->recv_ack) + hit_info->recv_bytes);
+			csum32 = csum32_add(csum32_add(csum32, tcph->sent_seq), tcph->recv_ack);
+			tcph->cksum = ~csum16_add(csum32 & 0xFFFF, csum32 >> 16);
+		};
+
+		if (rte_be_to_cpu_16(ipv4h->total_length) <= 9 + (ipv4h->ihl << 2) + (tcph->data_off >> 2))
+			goto pass;
+
+		cqlv4h = (struct cqlv4_hdr*)((void*)tcph + (tcph->data_off >> 2));
+
+		cql_body_len = rte_be_to_cpu_16(ipv4h->total_length) + (void*)ipv4h - (void*)(cqlv4h + 1);
+
+		if (cqlv4h->opecode != CQL_OP_RESULT) 
+			goto pass;
+		
+		seq_uniq.seq = tcph->sent_seq;
+
+		// DEBUG_PRINTF("%d: lookup key_info:\n", lcore_id);
+		// DEBUG_PRINTF("      client_addr = %u\n", seq_uniq.tcp_key.client_addr);
+		// DEBUG_PRINTF("      server_addr = %u\n", seq_uniq.tcp_key.server_addr);
+		// DEBUG_PRINTF("      seq = %u\n", seq_uniq.seq);
+		// DEBUG_PRINTF("      client_port = %u\n", seq_uniq.tcp_key.client_port);
+
+		sig = rte_hash_hash(key_handle, &seq_uniq);
+		if ((ret = rte_hash_lookup_with_hash(key_handle, &seq_uniq, sig)) < 0) {
+			goto pass;
+		}
+
+		struct cache_key *ck = &key_table[ret];
+
+		cql_body = cqlv4h + 1;
+
+		uint32_t result_kind = rte_be_to_cpu_32(*(rte_be32_t*)cql_body);
+
+		if (result_kind == CQL_RESULT_KIND_PREPARED) {
+			struct prepared_entry *p_entry;
+			uint16_t id_len, id_hash, prepared_index;
+			char *id_ptr;
+
+			id_len = rte_be_to_cpu_16(*(rte_be16_t*)(cql_body + sizeof(uint32_t)));
+			id_ptr = cql_body + sizeof(rte_be32_t) + sizeof(rte_be16_t);
+			id_hash = fnv1a_hash(id_ptr, id_len, FNV_OFFSET_BASIS_32);
+
+			prepared_index = id_hash % PREPARED_ENTRY_SIZE;
+			p_entry = &prepared_table[prepared_index];
+
+			rte_memcpy(p_entry->id, id_ptr, id_len);
+			p_entry->id_len = id_len;
+			p_entry->key = ck;
+		} else {
+			struct cache_entry *c_entry, old_c_entry;
+			uint32_t cache_index;
+
+			cache_index = ck->hash % CACHE_ENTRY_SIZE;
+			c_entry = &cache_table[cache_index];
+
+			if ((*buf = rte_pktmbuf_clone(m, clone_pool)) == NULL)
+				printf("%d: failed to clone mbuf\n", lcore_id);
+
+			if (rte_pktmbuf_adj(m, (void*)(cqlv4h + 1) - (void*)eth) == NULL)
+				printf("%d: failed to adjust packet.\n", lcore_id);
+
+			m->pkt_len = cql_body_len;
+
+			rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
+
+			old_c_entry.key = (struct cache_key*)
+				rte_atomic64_exchange((uint64_t*)&c_entry->key, (uint64_t)ck);
+			old_c_entry.m_data = (struct rte_mbuf*)
+				rte_atomic64_exchange((uint64_t*)&c_entry->m_data, (uint64_t)m);
+			if (old_c_entry.key)
+				rte_hash_free_key_with_position(key_handle, old_c_entry.key->pos);
+			if (old_c_entry.m_data)
+				rte_pktmbuf_free(old_c_entry.m_data);
+
+			DEBUG_PRINTF("%d: cache_table updated %u\n", lcore_id, cache_index);
+			DEBUG_PRINTF("entry->data_len = %u\n", c_entry->m_data->data_len);
+			DEBUG_PRINTF("%d: data = '%.*s'\n", lcore_id, c_entry->m_data->data_len, (char*)c_entry->m_data->buf_addr);
+		}
 
 	pass:			
 		if (!rte_is_broadcast_ether_addr(&eth->dst_addr)			
