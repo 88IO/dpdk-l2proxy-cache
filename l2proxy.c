@@ -17,6 +17,52 @@
 #include <rte_jhash.h>
 #include <rte_atomic.h>
 
+#include <rte_cycles.h>
+#include <stdlib.h>
+
+int compare(const void *pa, const void *pb) {
+    double a = *(double*)pa;
+    double b = *(double*)pb;
+
+    if (a > b) {
+        return 1;
+    } else if (a < b) {
+        return -1;
+    } else {
+        return 0;
+    }
+}
+
+double calcMedian(double values[], unsigned int num) {
+    double median;
+
+    /* 配列valuesの値の並び替え */
+    qsort(values, num, sizeof(double), compare);
+
+    /* 値の数が偶数個であるかどうかを判断 */
+    if (num % 2 == 0) {
+        /* 値の数が偶数個の場合は中央の２つの値の平均を中央値とする */
+        median = (values[num / 2] + values[num / 2 - 1]) / 2;
+    } else {
+        /* 値の数が奇数個の場合は中央の値そのものを中央値とする */
+        median = values[num / 2];
+    }
+    return median;
+}
+
+double calcMean(double values[], unsigned int num) {
+	double sum;
+
+	for (int i = 0; i < num; i++)
+		sum += values[i];
+
+	return sum / num;
+}
+// double c2s[400000], s2c[400000];
+// uint32_t c2si = 0;
+// uint32_t s2ci = 0;
+
+
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
@@ -564,6 +610,7 @@ client2server(__rte_unused void *arg)
 	printf("lcore %u: client --> server\n", lcore_id);
 
 	while (likely(!force_quit)) {
+		// uint64_t s = rte_rdtsc_precise();
 		/* Get burst of RX packets, from first port of pair. */
 		const uint16_t nb_rx = rte_eth_rx_burst(PORT0, 0, bufs, BURST_SIZE);
 
@@ -601,6 +648,10 @@ client2server(__rte_unused void *arg)
 		stats0.pass += nb_tx0;
 		stats0.reply += nb_tx1;
 		stats0.error += nb_rx - nb_tx0 - nb_tx1;
+
+		// if (nb_tx0) {
+		// 	c2s[c2si++] = (double)(rte_rdtsc_precise() - s) * 1000000 / rte_get_tsc_hz();
+		// }
 	}
 
 	return 0;
@@ -742,6 +793,7 @@ server2client(void *pool)
 	printf("lcore %u: server --> client\n", lcore_id);
 
 	while (likely(!force_quit)) {
+		// uint64_t s = rte_rdtsc_precise();
 		/* Get burst of RX packets, from first port of pair. */
 		const uint16_t nb_rx = rte_eth_rx_burst(PORT1, 0, bufs, BURST_SIZE);
 
@@ -771,6 +823,10 @@ server2client(void *pool)
 		}
 
 		stats1.error += nb_rx - nb_tx0;
+
+		// if (nb_tx0) {
+		// 	s2c[s2ci++] = (double)(rte_rdtsc_precise() - s) * 1000000 / rte_get_tsc_hz();
+		// }
 	}
 
 	return 0;
@@ -787,14 +843,22 @@ signal_handler(int signum)
 				stats0.pass, stats0.set_miss, 
 				stats0.set_hit, stats0.get_miss,
 				stats0.reply, stats0.error);
-		printf(" ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
+		printf("  ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
 		        eth_stats.ipackets, eth_stats.ierrors, eth_stats.imissed, eth_stats.opackets, eth_stats.oerrors);
 
 		rte_eth_stats_get(1, &eth_stats);
 		printf("stats: client <-- server\n  pass = %u, reply = %u, error = %u\n",
 				stats1.pass, stats1.reply, stats1.error);
-		printf(" ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
+		printf("  ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
 		        eth_stats.ipackets, eth_stats.ierrors, eth_stats.imissed, eth_stats.opackets, eth_stats.oerrors);
+
+		// printf("client --> server: %d\n", c2si);
+		// printf("  mean  : %lf\n", calcMean(c2s, c2si));
+		// printf("  median: %lf\n", calcMedian(c2s, c2si));
+
+		// printf("server --> client: %d\n", s2ci);
+		// printf("  mean  : %lf\n", calcMean(s2c, s2ci));
+		// printf("  median: %lf\n", calcMedian(s2c, s2ci));
 
 		force_quit = true;
 	}
