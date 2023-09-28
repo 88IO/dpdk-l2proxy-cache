@@ -1,6 +1,8 @@
+#define _GNU_SOURCE
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright(c) 2010-2015 Intel Corporation
  */
+//#define PROC_MULTI
 
 #include <stdint.h>
 #include <inttypes.h>
@@ -19,45 +21,46 @@
 
 #include <rte_cycles.h>
 #include <stdlib.h>
+#include <pthread.h>
 
-int compare(const void *pa, const void *pb) {
-    double a = *(double*)pa;
-    double b = *(double*)pb;
-
-    if (a > b) {
-        return 1;
-    } else if (a < b) {
-        return -1;
-    } else {
-        return 0;
-    }
-}
-
-double calcMedian(double values[], unsigned int num) {
-    double median;
-
-    /* 配列valuesの値の並び替え */
-    qsort(values, num, sizeof(double), compare);
-
-    /* 値の数が偶数個であるかどうかを判断 */
-    if (num % 2 == 0) {
-        /* 値の数が偶数個の場合は中央の２つの値の平均を中央値とする */
-        median = (values[num / 2] + values[num / 2 - 1]) / 2;
-    } else {
-        /* 値の数が奇数個の場合は中央の値そのものを中央値とする */
-        median = values[num / 2];
-    }
-    return median;
-}
-
-double calcMean(double values[], unsigned int num) {
-	double sum;
-
-	for (int i = 0; i < num; i++)
-		sum += values[i];
-
-	return sum / num;
-}
+// int compare(const void *pa, const void *pb) {
+//     double a = *(double*)pa;
+//     double b = *(double*)pb;
+// 
+//     if (a > b) {
+//         return 1;
+//     } else if (a < b) {
+//         return -1;
+//     } else {
+//         return 0;
+//     }
+// }
+// 
+// double calcMedian(double values[], unsigned int num) {
+//     double median;
+// 
+//     /* 配列valuesの値の並び替え */
+//     qsort(values, num, sizeof(double), compare);
+// 
+//     /* 値の数が偶数個であるかどうかを判断 */
+//     if (num % 2 == 0) {
+//         /* 値の数が偶数個の場合は中央の２つの値の平均を中央値とする */
+//         median = (values[num / 2] + values[num / 2 - 1]) / 2;
+//     } else {
+//         /* 値の数が奇数個の場合は中央の値そのものを中央値とする */
+//         median = values[num / 2];
+//     }
+//     return median;
+// }
+// 
+// double calcMean(double values[], unsigned int num) {
+// 	double sum;
+// 
+// 	for (int i = 0; i < num; i++)
+// 		sum += values[i];
+// 
+// 	return sum / num;
+// }
 // double c2s[400000], s2c[400000];
 // uint32_t c2si = 0;
 // uint32_t s2ci = 0;
@@ -66,7 +69,7 @@ double calcMean(double values[], unsigned int num) {
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
-#define NUM_MBUFS 8191
+#define NUM_MBUFS 16383 //8191 
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
 
@@ -119,6 +122,7 @@ struct cache_key {
 struct cache_entry {
 	struct cache_key *key;
 	struct rte_mbuf *m_data;
+	pthread_rwlock_t lock;
 };
 
 struct tcp_info {
@@ -136,6 +140,7 @@ struct _stats {
 	uint32_t pass;
 	uint32_t reply;
 	uint32_t error;
+	uint32_t _dummy[8]; // to adjust cache line
 };
 
 struct mbuf_conf {
@@ -212,7 +217,11 @@ enum resp_method {
 
 static volatile bool force_quit;
 
-static struct _stats stats0, stats1, stats0_prev, stats1_prev;
+#ifdef PROC_MULTI
+static struct _stats stats[4], stats_prev[4];
+#else
+static struct _stats stats[2], stats_prev[2];
+#endif
 
 struct rte_hash *arp_handle, *key_handle, *tcp_handle;
 
@@ -221,18 +230,6 @@ static struct cache_entry resp_cache[CACHE_ENTRY_SIZE] __rte_cache_aligned;
 static struct rte_ether_addr arp_table[ARP_ENTRY_SIZE] __rte_cache_aligned;
 static struct cache_key key_table[CACHE_ENTRY_SIZE + CONN_ENTRY_SIZE] __rte_cache_aligned;
 static struct tcp_info tcp_table[CONN_ENTRY_SIZE] __rte_cache_aligned;
-
-static void 
-print_stats() {
-	printf("stats: client --> server\n  pass = %u (set_miss = %u, set_hit = %u, get_miss = %u), reply = %u, error = %u\n",
-			stats0.pass - stats0_prev.pass, stats0.set_miss - stats0_prev.set_miss, 
-			stats0.set_hit - stats0_prev.set_hit, stats0.get_miss - stats0_prev.get_miss,
-			stats0.reply - stats0_prev.reply, stats0.error - stats0_prev.error);
-	printf("stats: client <-- server\n  pass = %u, reply = %u, error = %u\n",
-			stats1.pass - stats1_prev.pass, stats1.reply - stats1_prev.reply, stats1.error - stats1_prev.error);
-	stats0_prev = stats0;
-	stats1_prev = stats1;
-}
 
 /*
  * Initializes a given port using global settings and with the RX buffers
@@ -243,14 +240,17 @@ print_stats() {
 static inline int
 port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 {
-	const uint16_t rx_rings = 1, tx_rings = 2;
+	#ifndef PROC_MULTI 
+	const uint16_t rx_rings = 1, tx_rings = 1 + (port ? 0 : 1);
+	#else
+	const uint16_t rx_rings = 2, tx_rings = 2 + (port ? 0 : 2);
+	#endif
 	uint16_t nb_rxd = RX_RING_SIZE;
 	uint16_t nb_txd = TX_RING_SIZE;
 	int retval;
 	uint16_t q;
 	struct rte_eth_conf port_conf = {
 		.txmode = {
-			.mq_mode = RTE_ETH_MQ_TX_NONE,
 			.offloads =
 				RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
 				RTE_ETH_TX_OFFLOAD_TCP_CKSUM
@@ -260,7 +260,7 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 		},
 		.rx_adv_conf = {
 			.rss_conf = {
-				.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP
+				.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP 
 			}
 		}
 	};
@@ -282,6 +282,9 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	    || !(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) {
 		return -1;
 	}
+
+	if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH)
+		port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
 
 	port_conf.txmode.offloads &= dev_info.tx_offload_capa;
 	port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
@@ -465,14 +468,18 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 		
 		switch (resp_m) {
 		case GET:
-			DEBUG_PRINTF("      entry->valid = %d, entry->hash = %u, entry->key = %.*s\n",
-				entry->valid, entry->hash, entry->key_len, entry->key);
-			DEBUG_PRINTF("      hash = %u,        key = %.*s\n",
-				key_hash, key_len, pos);
+			if (pthread_rwlock_tryrdlock(&entry->lock)) {
+				goto resp;
+			}
 
 			if (entry->key && key_hash == entry->key->hash
 					&& !strncmp(pos, entry->key->data, key_len)) {
 				DEBUG_PRINTF("%d: GET HIT hook.\n", lcore_id);
+				
+				DEBUG_PRINTF("      entry->hash = %u, entry->key = %.*s\n",
+								entry->key->hash, entry->key->len, entry->key->data);
+				DEBUG_PRINTF("      hash = %u,        key = %.*s\n",
+								key_hash, key_len, pos);
 
 				//printf("0: [%u] refcnt = %d\n", cache_index, entry->m_data->refcnt);
 
@@ -494,6 +501,8 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 				}
 				hit_info->recv_bytes += payload_len;
 				hit_info->send_bytes += entry->m_data->data_len;
+
+				pthread_rwlock_unlock(&entry->lock);
 
 				RTE_SWAP(eth->src_addr, eth->dst_addr);
 				RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
@@ -520,6 +529,8 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 				*buf_reply = m;
 				return 1;
 			} else {
+				pthread_rwlock_unlock(&entry->lock);
+				
 				DEBUG_PRINTF("%d: GET MISS hook.\n", lcore_id);
 
 				seq_uniq.seq = tcph->recv_ack;
@@ -541,25 +552,39 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 					printf("failed to add key\n");
 				}
 
-				stats0.get_miss++;
+				stats[lcore_id].get_miss++;
 			}	
 			break;
 		case SET:
 			DEBUG_PRINTF("%d: SET hook.\n", lcore_id);
+			if (pthread_rwlock_tryrdlock(&entry->lock)) {
+				goto resp;
+			}
 
 			if (entry->key && key_hash == entry->key->hash
 					&& !strncmp(pos, entry->key->data, key_len)) {
-				old_entry.key = (struct cache_key*)
-					rte_atomic64_exchange((uint64_t*)&entry->key, (uint64_t)NULL);
-				old_entry.m_data = (struct rte_mbuf*)
-					rte_atomic64_exchange((uint64_t*)&entry->m_data, (uint64_t)NULL);
+				// old_entry.key = (struct cache_key*)
+				// 	rte_atomic64_exchange((uint64_t*)&entry->key, (uint64_t)NULL);
+				// old_entry.m_data = (struct rte_mbuf*)
+				// 	rte_atomic64_exchange((uint64_t*)&entry->m_data, (uint64_t)NULL);
+				old_entry.key = entry->key;
+				old_entry.m_data = entry->m_data;
+				
+				pthread_rwlock_unlock(&entry->lock);
+
+				pthread_rwlock_wrlock(&entry->lock);
+				entry->key = NULL;
+				entry->m_data = NULL;
+				pthread_rwlock_unlock(&entry->lock);
+
 				if (old_entry.key)
 					rte_hash_free_key_with_position(key_handle, old_entry.key->pos);
 				if (old_entry.m_data)
 					rte_pktmbuf_free(old_entry.m_data);
-				stats0.set_hit++;
+				stats[lcore_id].set_hit++;
 			} else {
-				stats0.set_miss++;
+				pthread_rwlock_unlock(&entry->lock);
+				stats[lcore_id].set_miss++;
 			}
 			break;
 		default:
@@ -598,6 +623,7 @@ client2server(__rte_unused void *arg)
 {
 	int ret;
 	uint16_t j;
+	uint32_t ring_rx0, ring_tx0, ring_tx1; 
 	uint32_t lcore_id, nb_pass, nb_reply;
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_reply[BURST_SIZE];
 	struct rte_ether_addr eth_tx_port_addr;
@@ -607,16 +633,21 @@ client2server(__rte_unused void *arg)
 		return ret;
 
 	lcore_id = rte_lcore_id();
+	ring_rx0 = lcore_id / 2;
+	ring_tx0 = lcore_id / 2;
+	ring_tx1 = lcore_id + 1;
 	printf("lcore %u: client --> server\n", lcore_id);
+	printf("lcore %u: rx0 = %d, tx0 = %d, tx1 = %d\n", lcore_id, ring_rx0, ring_tx0, ring_tx1);
 
 	while (likely(!force_quit)) {
 		// uint64_t s = rte_rdtsc_precise();
 		/* Get burst of RX packets, from first port of pair. */
-		const uint16_t nb_rx = rte_eth_rx_burst(PORT0, 0, bufs, BURST_SIZE);
+		const uint16_t nb_rx = rte_eth_rx_burst(PORT0, ring_rx0, bufs, BURST_SIZE);
 
 		if (unlikely(nb_rx == 0))
 			continue;
-
+		//printf("%d: rx = %d\n", lcore_id, nb_rx);
+		
 		nb_reply = 0;
 
 		for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
@@ -634,20 +665,25 @@ client2server(__rte_unused void *arg)
 								&bufs[j - nb_reply], &bufs_reply[nb_reply]);
 		}
 
-		const uint16_t nb_tx1 = rte_eth_tx_burst(PORT0, 1, bufs_reply, nb_reply);
+		const uint16_t nb_tx1 = rte_eth_tx_burst(PORT0, ring_tx1, bufs_reply, nb_reply);
 		if (unlikely(nb_tx1 < nb_reply)) {
 			rte_pktmbuf_free_bulk(&bufs_reply[nb_tx1], nb_reply - nb_tx1);
 		}
 
 		nb_pass = nb_rx - nb_reply;
-		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT1, 0, bufs, nb_pass);
+		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT1, ring_tx0, bufs, nb_pass);
 		if (unlikely(nb_tx0 < nb_pass)) {
 			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_pass - nb_tx0);
 		}
 
-		stats0.pass += nb_tx0;
-		stats0.reply += nb_tx1;
-		stats0.error += nb_rx - nb_tx0 - nb_tx1;
+		// if (nb_pass != nb_tx0) {
+		// 	printf("%d: rx = %d, nb_pass = %d, nb_reply = %d, tx0 = %d, tx1 = %d\n", lcore_id, nb_rx, nb_pass, nb_reply, nb_tx0, nb_tx1);
+		// 	printf("%d: mempool avail = %d\n", lcore_id, rte_mempool_avail_count(arg));
+		// }
+
+		stats[lcore_id].pass += nb_tx0;
+		stats[lcore_id].reply += nb_tx1;
+		stats[lcore_id].error += nb_rx - nb_tx0 - nb_tx1;
 
 		// if (nb_tx0) {
 		// 	c2s[c2si++] = (double)(rte_rdtsc_precise() - s) * 1000000 / rte_get_tsc_hz();
@@ -729,6 +765,10 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 
 		entry = &resp_cache[cache_index];
 
+		if (pthread_rwlock_trywrlock(&entry->lock)) {
+			goto pass;
+		}
+
 		if ((*buf = rte_pktmbuf_clone(m, clone_pool)) == NULL)
 			printf("%d: failed to clone mbuf\n", lcore_id);
 
@@ -738,10 +778,16 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 
 		rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
 
-		old_entry.key = (struct cache_key*)
-			rte_atomic64_exchange((uint64_t*)&entry->key, (uint64_t)ck);
-		old_entry.m_data = (struct rte_mbuf*)
-			rte_atomic64_exchange((uint64_t*)&entry->m_data, (uint64_t)m);
+		// old_entry.key = (struct cache_key*)
+		// 	rte_atomic64_exchange((uint64_t*)&entry->key, (uint64_t)ck);
+		// old_entry.m_data = (struct rte_mbuf*)
+		// 	rte_atomic64_exchange((uint64_t*)&entry->m_data, (uint64_t)m);
+		old_entry.key = entry->key;
+		old_entry.m_data = entry->m_data;
+		entry->key = ck;
+		entry->m_data = m;
+		pthread_rwlock_unlock(&entry->lock);
+		
 		if (old_entry.key)
 			rte_hash_free_key_with_position(key_handle, old_entry.key->pos);
 		if (old_entry.m_data)
@@ -769,36 +815,31 @@ static int
 server2client(void *pool)
 {
 	struct rte_mempool *clone_pool = pool;
-	int ret, ret_hit;
+	int ret;
 	uint16_t j;
-	uint32_t lcore_id, sig, cache_index, payload_len; 
+	uint32_t ring_rx0, ring_tx0;
+	uint32_t lcore_id; 
 	struct rte_mbuf *bufs[BURST_SIZE], *bufs_clone[BURST_SIZE];
-	struct rte_mbuf *m;
-	struct rte_ether_hdr *eth;
 	struct rte_ether_addr eth_tx_port_addr;
-	struct rte_ipv4_hdr *ipv4h;
-	struct rte_tcp_hdr *tcph;
-	char *payload;
-	struct sequence_unique seq_uniq = {
-		.server_port = 6379
-	};
-	struct cache_entry *entry;
-	struct tcp_info *hit_info;
 
 	ret = rte_eth_macaddr_get(0, &eth_tx_port_addr);
 	if (ret != 0)
 		return ret;
 
 	lcore_id = rte_lcore_id();
+	ring_rx0 = (lcore_id - 1) / 2; 
+	ring_tx0 = lcore_id - 1; 
 	printf("lcore %u: server --> client\n", lcore_id);
+	printf("lcore %u: rx0 = %d, tx0 = %d\n", lcore_id, ring_rx0, ring_tx0);
 
 	while (likely(!force_quit)) {
 		// uint64_t s = rte_rdtsc_precise();
 		/* Get burst of RX packets, from first port of pair. */
-		const uint16_t nb_rx = rte_eth_rx_burst(PORT1, 0, bufs, BURST_SIZE);
+		const uint16_t nb_rx = rte_eth_rx_burst(PORT1, ring_rx0, bufs, BURST_SIZE);
 
 		if (unlikely(nb_rx == 0))
 			continue;
+		//printf("%d: rx = %d\n", lcore_id, nb_rx);
 
 		for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
 			rte_prefetch0(rte_pktmbuf_mtod(
@@ -814,15 +855,15 @@ server2client(void *pool)
 		}
 
 		/* Send burst of TX packets, to first port of pair. */
-		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT0, 0, bufs, nb_rx);
-		stats1.pass += nb_tx0;
+		const uint16_t nb_tx0 = rte_eth_tx_burst(PORT0, ring_tx0, bufs, nb_rx);
+		stats[lcore_id].pass += nb_tx0;
 
 		/* Free any unsent packets. */
 		if (unlikely(nb_tx0 < nb_rx)) {
 			rte_pktmbuf_free_bulk(&bufs[nb_tx0], nb_rx - nb_tx0);
 		}
 
-		stats1.error += nb_rx - nb_tx0;
+		stats[lcore_id].error += nb_rx - nb_tx0;
 
 		// if (nb_tx0) {
 		// 	s2c[s2ci++] = (double)(rte_rdtsc_precise() - s) * 1000000 / rte_get_tsc_hz();
@@ -837,19 +878,52 @@ signal_handler(int signum)
 {
 	if (signum == SIGINT || signum == SIGTERM) {
 		struct rte_eth_stats eth_stats;
+		struct _stats stats_total;
+
+		memset(&stats_total, 0, sizeof(stats_total));
+		printf("stats: client --> server\n");
+		for (int i = 0; i < sizeof(stats) / sizeof(stats[0]); i += 2) {
+			printf("  lcore%d: pass = %u (set_miss = %u, set_hit = %u, get_miss = %u), reply = %u, error = %u\n",
+					i,
+					stats[i].pass, stats[i].set_miss, 
+					stats[i].set_hit, stats[i].get_miss,
+					stats[i].reply, stats[i].error);
+			stats_total.pass += stats[i].pass;
+			stats_total.set_miss += stats[i].set_miss;
+			stats_total.set_hit += stats[i].set_hit;
+			stats_total.get_miss += stats[i].get_miss;
+			stats_total.reply += stats[i].reply;
+			stats_total.error += stats[i].error;
+		}
+		printf("  total: pass = %u (set_miss = %u, set_hit = %u, get_miss = %u), reply = %u, error = %u\n",
+				stats_total.pass, stats_total.set_miss, 
+				stats_total.set_hit, stats_total.get_miss,
+				stats_total.reply, stats_total.error);
+
+		printf("\n");
+
+		memset(&stats_total, 0, sizeof(stats_total));
+		printf("stats: client <-- server\n");
+		for (int i = 1; i < sizeof(stats) / sizeof(stats[0]); i += 2) {
+			printf("  lcore%d: pass = %u, reply = %u, error = %u\n",
+					i, stats[i].pass, stats[i].reply, stats[i].error);
+			stats_total.pass += stats[i].pass;
+			stats_total.set_miss += stats[i].set_miss;
+			stats_total.set_hit += stats[i].set_hit;
+			stats_total.get_miss += stats[i].get_miss;
+			stats_total.reply += stats[i].reply;
+			stats_total.error += stats[i].error;
+		}
+		printf("  total: pass = %u, reply = %u, error = %u\n",
+				stats_total.pass, stats_total.reply, stats_total.error);
+
+		printf("\n");
 
 		rte_eth_stats_get(0, &eth_stats);
-		printf("stats: client --> server\n  pass = %u (set_miss = %u, set_hit = %u, get_miss = %u), reply = %u, error = %u\n",
-				stats0.pass, stats0.set_miss, 
-				stats0.set_hit, stats0.get_miss,
-				stats0.reply, stats0.error);
-		printf("  ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
-		        eth_stats.ipackets, eth_stats.ierrors, eth_stats.imissed, eth_stats.opackets, eth_stats.oerrors);
-
+		printf("port0: ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
+			    eth_stats.ipackets, eth_stats.ierrors, eth_stats.imissed, eth_stats.opackets, eth_stats.oerrors);
 		rte_eth_stats_get(1, &eth_stats);
-		printf("stats: client <-- server\n  pass = %u, reply = %u, error = %u\n",
-				stats1.pass, stats1.reply, stats1.error);
-		printf("  ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
+		printf("port1: ipackets = %lu, ierrors = %lu, imissed = %lu, opackets = %lu, oerrors = %lu\n", 
 		        eth_stats.ipackets, eth_stats.ierrors, eth_stats.imissed, eth_stats.opackets, eth_stats.oerrors);
 
 		// printf("client --> server: %d\n", c2si);
@@ -875,6 +949,7 @@ main(int argc, char *argv[])
 	unsigned nb_ports;
 	uint16_t portid;
 	int lcoreid;
+	pthread_rwlockattr_t attr;
 
 	/* Initializion the Environment Abstraction Layer (EAL). 8< */
 	int ret = rte_eal_init(argc, argv);
@@ -936,13 +1011,20 @@ main(int argc, char *argv[])
 	tcp_handle = rte_hash_create(&tcp_param);
 	if (!tcp_handle)
 		rte_exit(EXIT_FAILURE, "Cannot init conn table.\n");
-	
-	//resp_cache = calloc(CACHE_ENTRY_SIZE, sizeof(struct cache_entry));
+
+	pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+	for (int i = 0; i < CACHE_ENTRY_SIZE; i++) {
+		pthread_rwlock_init(&resp_cache[i].lock, &attr);
+	}
 
 	rte_eal_remote_launch(server2client, clone_pool, rte_get_next_lcore(-1, 1, 0));
+	#ifdef PROC_MULTI
+	rte_eal_remote_launch(client2server, mbuf_pool, 2);
+	rte_eal_remote_launch(server2client, clone_pool, 3);
+	#endif
 
 	/* Call lcore_main on the main core only. Called on single lcore. 8< */
-	client2server(NULL);
+	client2server(mbuf_pool);
 	/* >8 End of called on single lcore. */
 
 	rte_eal_mp_wait_lcore();
