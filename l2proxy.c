@@ -18,53 +18,13 @@
 #include <rte_hash.h>
 #include <rte_jhash.h>
 #include <rte_atomic.h>
+#include <rte_spinlock.h>
 
 #include <rte_cycles.h>
 #include <stdlib.h>
 #include <pthread.h>
 
-// int compare(const void *pa, const void *pb) {
-//     double a = *(double*)pa;
-//     double b = *(double*)pb;
-// 
-//     if (a > b) {
-//         return 1;
-//     } else if (a < b) {
-//         return -1;
-//     } else {
-//         return 0;
-//     }
-// }
-// 
-// double calcMedian(double values[], unsigned int num) {
-//     double median;
-// 
-//     /* 配列valuesの値の並び替え */
-//     qsort(values, num, sizeof(double), compare);
-// 
-//     /* 値の数が偶数個であるかどうかを判断 */
-//     if (num % 2 == 0) {
-//         /* 値の数が偶数個の場合は中央の２つの値の平均を中央値とする */
-//         median = (values[num / 2] + values[num / 2 - 1]) / 2;
-//     } else {
-//         /* 値の数が奇数個の場合は中央の値そのものを中央値とする */
-//         median = values[num / 2];
-//     }
-//     return median;
-// }
-// 
-// double calcMean(double values[], unsigned int num) {
-// 	double sum;
-// 
-// 	for (int i = 0; i < num; i++)
-// 		sum += values[i];
-// 
-// 	return sum / num;
-// }
-// double c2s[400000], s2c[400000];
-// uint32_t c2si = 0;
-// uint32_t s2ci = 0;
-
+#define SPIN_LOCK_ENTRY
 
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
@@ -122,7 +82,14 @@ struct cache_key {
 struct cache_entry {
 	struct cache_key *key;
 	struct rte_mbuf *m_data;
-	pthread_rwlock_t lock;
+	union {
+		rte_atomic32_t rwlock;
+		rte_spinlock_t spinlock;
+		struct {
+			rte_atomic16_t w;
+			rte_atomic16_t r;
+		} lock;
+	};
 };
 
 struct tcp_info {
@@ -424,7 +391,7 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 		tcph = (struct rte_tcp_hdr *)((void *)ipv4h + (ipv4h->ihl << 2));
 
 		if (tcph->dst_port != rte_cpu_to_be_16(6379))
-			goto pass;	
+			goto pass;
 
 		pos = payload = (void *)tcph + (tcph->data_off >> 2);
 
@@ -468,9 +435,17 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 		
 		switch (resp_m) {
 		case GET:
-			if (pthread_rwlock_tryrdlock(&entry->lock)) {
+			#ifdef SPIN_LOCK_ENTRY
+			if (rte_spinlock_trylock(&entry->spinlock) == 0) {
 				goto resp;
 			}
+			#else
+			rte_atomic16_inc(&entry->lock.r)
+			if (rte_atomic16_read(&entry->lock.w)) {
+				rte_atomic16_dec(&entry->lock.r)
+				goto resp;
+			}
+			#endif
 
 			if (entry->key && key_hash == entry->key->hash
 					&& !strncmp(pos, entry->key->data, key_len)) {
@@ -502,7 +477,11 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 				hit_info->recv_bytes += payload_len;
 				hit_info->send_bytes += entry->m_data->data_len;
 
-				pthread_rwlock_unlock(&entry->lock);
+				#ifdef SPIN_LOCK_ENTRY
+				rte_spinlock_unlock(&entry->spinlock);
+				#else
+				rte_atomic16_dec(&entry->lock.r);
+				#endif
 
 				RTE_SWAP(eth->src_addr, eth->dst_addr);
 				RTE_SWAP(ipv4h->src_addr, ipv4h->dst_addr);
@@ -529,7 +508,11 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 				*buf_reply = m;
 				return 1;
 			} else {
-				pthread_rwlock_unlock(&entry->lock);
+				#ifdef SPIN_LOCK_ENTRY
+				rte_spinlock_unlock(&entry->spinlock);
+				#else
+				rte_atomic16_dec(&entry->lock.r);
+				#endif
 				
 				DEBUG_PRINTF("%d: GET MISS hook.\n", lcore_id);
 
@@ -557,9 +540,15 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 			break;
 		case SET:
 			DEBUG_PRINTF("%d: SET hook.\n", lcore_id);
-			if (pthread_rwlock_tryrdlock(&entry->lock)) {
+
+			#ifdef SPIN_LOCK_ENTRY
+			rte_spinlock_lock(&entry->spinlock);
+			#else
+			if (rte_atomic16_test_and_set(&entry->lock.w) == 0) {
 				goto resp;
 			}
+			while (rte_atomic16_read(&entry->lock.r)) { }
+			#endif
 
 			if (entry->key && key_hash == entry->key->hash
 					&& !strncmp(pos, entry->key->data, key_len)) {
@@ -570,12 +559,14 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 				old_entry.key = entry->key;
 				old_entry.m_data = entry->m_data;
 				
-				pthread_rwlock_unlock(&entry->lock);
-
-				pthread_rwlock_wrlock(&entry->lock);
 				entry->key = NULL;
 				entry->m_data = NULL;
-				pthread_rwlock_unlock(&entry->lock);
+
+				#ifdef SPIN_LOCK_ENTRY
+				rte_spinlock_unlock(&entry->spinlock);
+				#else
+				rte_atomic16_clear(&entry->lock.w);
+				#endif
 
 				if (old_entry.key)
 					rte_hash_free_key_with_position(key_handle, old_entry.key->pos);
@@ -583,7 +574,11 @@ client_packet_process(struct rte_mbuf *m, struct rte_ether_addr *eth_tx_port_add
 					rte_pktmbuf_free(old_entry.m_data);
 				stats[lcore_id].set_hit++;
 			} else {
-				pthread_rwlock_unlock(&entry->lock);
+				#ifdef SPIN_LOCK_ENTRY
+				rte_spinlock_unlock(&entry->spinlock);
+				#else
+				rte_atomic16_clear(&entry->lock.w);
+				#endif
 				stats[lcore_id].set_miss++;
 			}
 			break;
@@ -764,10 +759,21 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 		cache_index = ck->hash % CACHE_ENTRY_SIZE;
 
 		entry = &resp_cache[cache_index];
+		DEBUG_PRINTF("%d: %u\n", lcore_id, sig);
 
-		if (pthread_rwlock_trywrlock(&entry->lock)) {
+		#ifdef SPIN_LOCK_ENTRY
+		if (rte_spinlock_trylock(&entry->spinlock) == 0) {
+			rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
+			rte_hash_free_key_with_position(key_handle, ck->pos);
 			goto pass;
 		}
+		#else
+		if (rte_atomic32_test_and_set(&entry->rwlock) == 0) {
+			rte_hash_del_key_with_hash(key_handle, &seq_uniq, sig);
+			rte_hash_free_key_with_position(key_handle, ck->pos);
+			goto pass;
+		}
+		#endif
 
 		if ((*buf = rte_pktmbuf_clone(m, clone_pool)) == NULL)
 			printf("%d: failed to clone mbuf\n", lcore_id);
@@ -786,7 +792,12 @@ server_packet_process(struct rte_mbuf **buf, struct rte_ether_addr *eth_tx_port_
 		old_entry.m_data = entry->m_data;
 		entry->key = ck;
 		entry->m_data = m;
-		pthread_rwlock_unlock(&entry->lock);
+		
+		#ifdef SPIN_LOCK_ENTRY
+		rte_spinlock_unlock(&entry->spinlock);
+		#else
+		rte_atomic16_clear(&entry->lock.w);
+		#endif
 		
 		if (old_entry.key)
 			rte_hash_free_key_with_position(key_handle, old_entry.key->pos);
@@ -949,7 +960,6 @@ main(int argc, char *argv[])
 	unsigned nb_ports;
 	uint16_t portid;
 	int lcoreid;
-	pthread_rwlockattr_t attr;
 
 	/* Initializion the Environment Abstraction Layer (EAL). 8< */
 	int ret = rte_eal_init(argc, argv);
@@ -1012,9 +1022,8 @@ main(int argc, char *argv[])
 	if (!tcp_handle)
 		rte_exit(EXIT_FAILURE, "Cannot init conn table.\n");
 
-	pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
 	for (int i = 0; i < CACHE_ENTRY_SIZE; i++) {
-		pthread_rwlock_init(&resp_cache[i].lock, &attr);
+		rte_atomic32_init(&resp_cache[i].rwlock);
 	}
 
 	rte_eal_remote_launch(server2client, clone_pool, rte_get_next_lcore(-1, 1, 0));
